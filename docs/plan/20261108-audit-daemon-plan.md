@@ -245,3 +245,22 @@ README の「未検証事項」に明記し、成功扱いにしない。
 - Phase 2: T2, T3, T4, T5, T11, および T12-1/2/5/6/7 のテスト（クライアント + fake で疎通）
 - Phase 3: T6, T7, T8, T9, T10, T1（設定）+ T12-3/4/8/9
 - Phase 4: README、要件対応表、`cargo fmt --check` / `cargo clippy -- -D warnings` / `cargo test`
+
+## 8. 実装中に決めたこと（計画からの差分）
+
+計画を進める中で必要になった判断。仕様からの逸脱は無し。
+
+| # | 決定 | 理由 |
+| --- | --- | --- |
+| 1 | 分割したバッチは 1 サイクルで順に全部送る（各バッチごとにターン完了を待つ） | 一部だけ送って残りを次サイクルに回すと、 finding の取りこぼしと順序の入れ替わりが起きる |
+| 2 | ターン本文にはエージェントの発話（`assistant_message` / `session_message`）だけを入れる | `user_message` は自分が送った文のエコーで、応答ではない。生イベントは別ファイルに全部残る |
+| 3 | 使い回し接続が死んでいた場合、**接続/書き込み段階の失敗に限り** 1 回だけ新しい接続で再試行する | その段階の失敗は「ブリッジが受け取っていない」ことが確実なので安全。読み取り段階は再試行しない |
+| 4 | 購読の再接続は 5 回で打ち切る（`MAX_WATCH_RECONNECTS`） | 落ち続ける購読で応答待ちタイムアウトまで接続を繰り返さない |
+| 5 | `idle` 遷移 + （`generating` を観測 or エージェント本文を受信）でターン完了とみなす | 短いターンでは `generating` が観測できないことがある |
+| 6 | findings カーソルの前進は `Sent` / `Idle`（送信済み）のときだけ | `Failed` / `Deferred` で消費すると、未送信の指摘が消える |
+| 7 | clippy は `all = deny` + `pedantic = allow` | pedantic の整数キャスト系は、範囲が自明な時刻・バイト数計算にノイズしか出さない |
+| 8 | 送信内容（全文）を台帳に保存する | 仕様書 §10 の「送信内容と `request_id` を記録」をそのまま満たす。量はサイクルあたり数 KB |
+
+検証結果（最終）: `cargo test` 92 件成功（lib 55 / daemon_cycle 21 / protocol_conformance 16）、
+`cargo fmt --all -- --check` と `cargo clippy --all-targets -- -D warnings` は無警告。
+実 Zed / 実スレッドの E2E と `LOCAL_PEERCRED` 検証は未検証（§6）。
