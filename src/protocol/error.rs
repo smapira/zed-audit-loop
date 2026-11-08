@@ -158,11 +158,11 @@ impl fmt::Display for ClientError {
 }
 
 impl std::error::Error for ClientError {
+    /// The I/O cause is already inside the message, so it is not offered again as
+    /// a source: `anyhow`'s `{:#}` would otherwise print it twice, which is what
+    /// an operator sees first when the bridge is not there.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::NotConnected { source, .. } | Self::Io { source, .. } => Some(source),
-            _ => None,
-        }
+        None
     }
 }
 
@@ -203,6 +203,24 @@ mod tests {
         ] {
             assert!(!error.never_reached_bridge(), "{error}");
         }
+    }
+
+    #[test]
+    fn the_io_cause_is_printed_once() {
+        let error = anyhow::Error::new(ClientError::NotConnected {
+            path: std::path::PathBuf::from("/tmp/missing.sock"),
+            source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        });
+
+        let rendered = format!("{error:#}");
+        assert_eq!(
+            rendered
+                .to_lowercase()
+                .matches("connection refused")
+                .count(),
+            1,
+            "{rendered}"
+        );
     }
 
     #[test]
