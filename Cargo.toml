@@ -1,0 +1,43 @@
+[package]
+name = "zed-audit-loop"
+version = "0.1.0"
+edition = "2024"
+description = "Audit daemon that drives Zed's external thread message bridge"
+license = "MIT"
+publish = false
+
+[lib]
+name = "zed_audit_loop"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zed-audit-loop"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "io-util",
+  "time",
+  "sync",
+  "signal",
+] }
+toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+# The daemon reads timestamps and byte counts as integers; the pedantic cast
+# lints would only add noise around values that cannot exceed their range.
+pedantic = { level = "allow", priority = -1 }
