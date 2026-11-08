@@ -46,6 +46,7 @@
 | §5.5 イベント種別（`entry_added` / `entry_updated` / `entry_removed` / `status_changed` / `title_updated` / `tool_authorization_*` / `turn_stopped`） | `protocol::EventKind`, `Daemon::await_turn` | `watching_streams_every_event_kind`, `tests/daemon_cycle.rs::events_arriving_after_the_turn_are_still_stored` |
 | §5.5 未知の `kind` でも壊れない | `EventKind::Other` | `protocol::types::tests::unknown_wire_values_are_preserved` |
 | §5.5 接続断で購読解除・過去は再生されない | `Daemon::await_turn`（再接続 + `get_thread_status` 読み直し） | `tests/daemon_cycle.rs::a_lost_watch_is_rebuilt_and_the_state_reread` |
+| §5.5 購読が落ち続けても無限ループしない | `daemon::MAX_WATCH_RECONNECTS` | `tests/daemon_cycle.rs::a_watch_that_keeps_dropping_ends_the_cycle` |
 
 ## §6 ステータス
 
@@ -60,7 +61,7 @@
 | --- | --- | --- |
 | 15 種の `error.code` を型付きで扱う | `protocol::ErrorCode` | `protocol::types::tests::recorded_rejections_are_the_ones_needing_a_fresh_request_id` |
 | 「推奨動作」を表として写像 | `ErrorCode::recommended_action` | 同上（分類の確認） |
-| `message_too_large` → 分割して再送 | `finding::render_batches`（送信前に分割）, `RecommendedAction::Split` | `finding::tests::batches_never_exceed_the_budget_and_keep_every_finding`, `tests/daemon_cycle.rs::large_findings_are_split_across_messages` |
+| `message_too_large` → 分割して再送 | `finding::render_batches`（送信前に分割・1 件が大きすぎる場合は切り詰め）, `RecommendedAction::Split` | `finding::tests::batches_never_exceed_the_budget_and_keep_every_finding`, `a_finding_larger_than_the_budget_is_truncated_not_dropped`, `tests/daemon_cycle.rs::large_findings_are_split_across_messages` |
 | `queue_full` → 時間を置いて再試行 | `Daemon::send_with_retries`（指数バックオフ） | `a_full_queue_is_retried_with_a_new_request_id` |
 | `duplicate_request` → 送信済み扱い | `RecommendedAction::AlreadySent` | `protocol::types::tests::recorded_rejections_...` |
 | `invalid_json` / `unknown_action` / `invalid_request` を握りつぶさない | `ClientError::MalformedResponse`, `Response::error_code` | `tests/protocol_conformance.rs::a_malformed_response_line_is_an_error_not_a_panic`, `an_unknown_action_rejection_is_surfaced_with_its_code`, `an_invalid_json_rejection_keeps_going` |
@@ -75,6 +76,7 @@
 | 応答本文は `entry.text` から取得 | `store::TurnCapture` | `a_cycle_sends_findings_and_stores_the_answer`, `store::tests::a_turn_concatenates_entries_in_index_order` |
 | `turn_stopped` が来ない場合の完了判定 | `store::is_finished_state` + `status_changed: idle` | `tests/daemon_cycle.rs::events_arriving_after_the_turn_are_still_stored` |
 | 応答が来ないまま時間切れでも送信は成立させる | `TurnOutcome::TimedOut` | `a_silent_agent_does_not_block_the_next_cycle` |
+| 短いターン（`generating` を観測できない）でも完了する | `Daemon::await_turn`（エージェント本文 + `idle` で完了） | `a_turn_without_a_generating_event_still_finishes` |
 
 ## §9 参照実装（CLI）
 
