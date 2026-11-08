@@ -179,6 +179,9 @@ pub trait FindingSource {
   次に読むまでソケットバッファに溜まります（`storage` のイベント列はターン中のみ）。
 - `command` ソースはサイクルごとに同期実行です（1 回/サイクルなので許容）。
 - ソケットパスは Unix socket の長さ制限（`SUN_LEN`）を受けるため、深いディレクトリに置けません。
+- `ledger.jsonl` は追記のみで、自動では削除しません（ローテートは人手）。
+- 1 件の `Finding` が `max_message_bytes` を超える場合は、その指摘だけを切り詰めて送ります
+  （未送信のまま永久にリトライするより、切り詰めて届ける方を選ぶ）。
 - 復元時に Zed の Agent Panel 表示が対象スレッドへ切り替わる場合があります（ブリッジ側の性質）。
 
 ## 10. 未検証事項（成功扱いにしないこと）
@@ -197,7 +200,7 @@ pub trait FindingSource {
 ## 11. テスト
 
 ```sh
-cargo test          # 92 tests: lib 55 / daemon_cycle 21 / protocol_conformance 16
+cargo test          # 94 tests: lib 57 / daemon_cycle 21 / protocol_conformance 16
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```

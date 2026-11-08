@@ -274,7 +274,13 @@ pub fn render_batches(findings: &[Finding], max_bytes: usize) -> Vec<String> {
     let mut current: Vec<String> = Vec::new();
     let mut current_len = 0usize;
     for finding in findings {
-        let block = render_finding(finding);
+        let mut block = render_finding(finding);
+        if block.len() > budget {
+            // One finding can be larger than a whole message. Truncating it is
+            // better than failing the send forever: the send would be refused
+            // locally and the finding would never be consumed.
+            block = truncate_block(block, budget);
+        }
         let block_len = block.len();
         if !current.is_empty() && current_len + block_len > budget {
             batches.push(std::mem::take(&mut current));
@@ -310,6 +316,23 @@ pub fn render_message(blocks: &[String], part: usize, parts: usize) -> String {
     message
 }
 
+/// Shortens one oversized finding so it fits a message on its own.
+fn truncate_block(block: String, budget: usize) -> String {
+    const MARKER: &str = "\n  ...(truncated)\n";
+    if block.len() <= budget {
+        return block;
+    }
+    let mut end = budget.saturating_sub(MARKER.len());
+    // Never split a multi-byte character.
+    while end > 0 && !block.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = block;
+    truncated.truncate(end);
+    truncated.push_str(MARKER);
+    truncated
+}
+
 /// One finding as a bullet.
 fn render_finding(finding: &Finding) -> String {
     let mut block = String::new();
@@ -338,7 +361,6 @@ fn render_finding(finding: &Finding) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     fn finding(summary: &str) -> Finding {
         Finding {
             id: "F-1".into(),
@@ -487,6 +509,40 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert!(!batches[0].contains("1/1"));
         assert!(batches[0].contains("【独立監査】"));
+    }
+
+    #[test]
+    fn a_finding_larger_than_the_budget_is_truncated_not_dropped() {
+        let huge = Finding {
+            id: "F-huge".into(),
+            severity: Severity::Error,
+            summary: "one very long finding".into(),
+            detail: Some("y".repeat(5_000)),
+            location: None,
+        };
+
+        let batches = render_batches(&[huge], 500);
+
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].len() <= 500, "length: {}", batches[0].len());
+        assert!(batches[0].contains("one very long finding"));
+        assert!(batches[0].contains("truncated"));
+    }
+
+    #[test]
+    fn truncation_keeps_utf8_intact() {
+        let wide = Finding {
+            summary: "日本語".repeat(200),
+            ..finding("x")
+        };
+
+        let batches = render_batches(&[wide], 400);
+
+        // `String::truncate` would have panicked on a character boundary; the
+        // marker proves the truncation path ran on a wide-character block.
+        assert!(!batches[0].contains('\u{fffd}'));
+        assert!(batches[0].contains("truncated"));
+        assert!(batches[0].contains("日本語"));
     }
 
     #[test]
