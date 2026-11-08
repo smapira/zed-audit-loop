@@ -197,7 +197,7 @@ pub trait FindingSource {
 ## 11. テスト
 
 ```sh
-cargo test          # 90 tests: lib 55 / daemon_cycle 19 / protocol_conformance 16
+cargo test          # 92 tests: lib 55 / daemon_cycle 21 / protocol_conformance 16
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```
@@ -217,6 +217,8 @@ NDJSON・行長上限・1 接続あたりの要求数・購読イベントを仕
 | `daemon_cycle::thread_unavailable_is_retried_with_the_same_request_id` | 未記録拒否は同一 id で再試行 |
 | `daemon_cycle::a_delivered_message_is_not_sent_again_after_a_restart` | 再起動しても二重配送しない |
 | `daemon_cycle::a_lost_watch_is_rebuilt_and_the_state_reread` | 切断 → 再接続 → 状態読み直し |
+| `daemon_cycle::a_watch_that_keeps_dropping_ends_the_cycle` | 再接続の上限（無限ループしない） |
+| `daemon_cycle::a_turn_without_a_generating_event_still_finishes` | `generating` を観測できなくても完了できる |
 
 ## 12. ライセンス
 

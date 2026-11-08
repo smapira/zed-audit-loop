@@ -278,6 +278,8 @@ pub struct Script {
     pub close_watch_after_send: bool,
     /// Never register the first watcher, so its connection ends immediately.
     pub close_first_watch: bool,
+    /// Never register any watcher, so every watch connection ends at once.
+    pub close_all_watches: bool,
     /// How many `watch_thread` requests were served.
     pub watches_served: usize,
 }
@@ -533,7 +535,10 @@ fn serve_connection(
                 script.watches_served += 1;
                 first
             };
-            let skip_registration = first && script.lock().expect("script").close_first_watch;
+            let skip_registration = {
+                let script = script.lock().expect("script");
+                script.close_all_watches || (first && script.close_first_watch)
+            };
             if register && !skip_registration {
                 // A clone keeps the socket open after this thread returns, so
                 // the client still sees a live subscription.

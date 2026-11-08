@@ -642,6 +642,73 @@ async fn events_arriving_after_the_turn_are_still_stored() {
     );
 }
 
+#[tokio::test]
+async fn a_watch_that_keeps_dropping_ends_the_cycle() {
+    let harness = Harness::new(
+        Script {
+            thread: Some(ThreadFacts::idle(THREAD)),
+            turn: Some(TurnScript::standard(THREAD, "never delivered")),
+            close_all_watches: true,
+            ..Script::default()
+        },
+        &[&finding("watch storm")],
+    );
+    let mut daemon = harness.daemon();
+    let started = std::time::Instant::now();
+
+    let outcome = daemon.run_once().await;
+
+    assert!(
+        matches!(outcome, CycleOutcome::Deferred(_)),
+        "got {}",
+        outcome.summary()
+    );
+    // The reconnect storm is capped instead of running until the response
+    // timeout, and the message itself was still delivered.
+    let watches = harness.bridge.requests_for("watch_thread").len();
+    assert!(watches <= 10, "watch attempts: {watches}");
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let ledger = harness.read_state_file("ledger.jsonl");
+    assert!(ledger.contains("\"delivered\""));
+}
+
+#[tokio::test]
+async fn a_turn_without_a_generating_event_still_finishes() {
+    let harness = Harness::new(
+        Script {
+            thread: Some(ThreadFacts::idle(THREAD)),
+            // A turn short enough that the bridge never reports `generating`.
+            turn: Some(TurnScript {
+                events: vec![
+                    entry_added(THREAD, 9, "assistant_message", "quick answer"),
+                    status_changed(THREAD, "idle"),
+                ],
+            }),
+            ..Script::default()
+        },
+        &[&finding("no generating event")],
+    );
+    let mut daemon = harness.daemon();
+    let started = std::time::Instant::now();
+
+    let outcome = daemon.run_once().await;
+
+    let CycleOutcome::Sent {
+        entries,
+        text_bytes,
+        ..
+    } = outcome.clone()
+    else {
+        panic!("expected a send, got {}", outcome.summary());
+    };
+    assert_eq!(entries, 1);
+    assert!(text_bytes > 0);
+    // It finished on the `idle` event, not by running out the timeout.
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let turns = harness.read_state_file(&format!("turns/{THREAD}.jsonl"));
+    assert!(turns.contains("quick answer"));
+}
+
 #[test]
 fn a_config_without_a_target_is_rejected() {
     let config = Config::default();

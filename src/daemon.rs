@@ -35,6 +35,11 @@ use crate::time::unix_millis;
 /// File under the storage directory that remembers how many findings were read.
 pub const FINDINGS_CURSOR_FILE: &str = "findings.cursor.json";
 
+/// How many times one turn may lose its watch before the cycle gives up. A
+/// bridge that keeps dropping the subscription must not turn the response wait
+/// into a reconnect storm.
+pub const MAX_WATCH_RECONNECTS: u32 = 5;
+
 /// What one cycle achieved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CycleOutcome {
@@ -368,10 +373,10 @@ impl Daemon {
 
         let outcome = self.deliver_batch(cycle_id, &thread_id, &batch).await;
 
-        // The findings were handled (sent, suppressed, or refused for good), so
-        // the cursor moves even when the answer never arrived: the message is in
-        // the thread either way.
-        if !matches!(outcome, CycleOutcome::Deferred(_))
+        // The cursor moves only when the message actually reached the thread (or
+        // was already there): a deferred or failed cycle keeps the findings, so
+        // the next attempt reports them again instead of losing them.
+        if matches!(outcome, CycleOutcome::Sent { .. } | CycleOutcome::Idle(_))
             && let Err(error) = self.source.commit(&batch.cursor)
         {
             self.logger.error(
@@ -720,7 +725,9 @@ impl Daemon {
                     if status.state == ThreadState::Generating {
                         seen_generating = true;
                     }
-                    if seen_generating && is_finished_state(&status.state) {
+                    if is_finished_state(&status.state)
+                        && (seen_generating || capture.saw_agent_text())
+                    {
                         return self.complete_turn(thread_id, request_id, capture, None);
                     }
                 }
@@ -763,6 +770,11 @@ impl Daemon {
                     // The stream is broken; reconnect on the next pass.
                     self.subscription = None;
                     lost += 1;
+                    if lost >= MAX_WATCH_RECONNECTS {
+                        return TurnOutcome::Lost(format!(
+                            "the watch kept failing ({lost} times): {error}"
+                        ));
+                    }
                     self.logger.warn(
                         "watch_error",
                         &[
@@ -777,6 +789,11 @@ impl Daemon {
                 Ok(Ok(None)) => {
                     self.subscription = None;
                     lost += 1;
+                    if lost >= MAX_WATCH_RECONNECTS {
+                        return TurnOutcome::Lost(format!(
+                            "the bridge closed the watch {lost} times"
+                        ));
+                    }
                     self.logger.info(
                         "watch_closed",
                         &[
@@ -818,7 +835,9 @@ impl Daemon {
                                         &[("cycle_id", cycle_id), ("thread_id", thread_id)],
                                     );
                                 }
-                                if is_finished_state(state) && seen_generating {
+                                if is_finished_state(state)
+                                    && (seen_generating || capture.saw_agent_text())
+                                {
                                     let subscription = self.subscription.take();
                                     let outcome =
                                         self.complete_turn(thread_id, request_id, capture, None);
@@ -894,8 +913,7 @@ impl Daemon {
                 .filter(|id| !id.trim().is_empty())
                 .ok_or_else(|| "no target thread configured".to_string()),
             TargetSelect::Latest => {
-                let request_id = format!("list-{}-", unix_millis(std::time::SystemTime::now()));
-                let request_id = format!("{request_id}{cycle_id}");
+                let request_id = format!("list-{cycle_id}");
                 match self.client.list_threads(&request_id).await {
                     Ok(response) if response.is_rejection() => Err(format!(
                         "list_threads was refused with {}",
