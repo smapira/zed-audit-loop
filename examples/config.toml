@@ -1,0 +1,43 @@
+# Copy to a path of your choice and edit. Every key has a default, so only the
+# values you want to change need to be present.
+
+[bridge]
+# Zed release channel: stable | preview | nightly | dev.
+channel = "stable"
+# Explicit socket path; wins over `channel`. `~/` is expanded.
+# socket = "~/Library/Application Support/Zed/agent-bridge-dev.sock"
+connect_timeout_ms = 3000
+request_timeout_ms = 20000
+
+[target]
+# The thread to audit. Get it from `zed-audit-loop list-threads`.
+thread_id = "6f1c2d3e-4b5a-4c7d-8e9f-0a1b2c3d4e5f"
+# Or pick the newest non-archived thread each cycle (then omit thread_id).
+# select = "latest"
+
+[cycle]
+interval_secs = 300
+await_response_secs = 900
+approval_poll_ms = 30000
+max_approval_wait_secs = 3600
+backoff_initial_ms = 500
+backoff_max_ms = 60000
+max_send_attempts = 6
+
+[storage]
+# dir = "~/Library/Application Support/zed-audit-loop"
+
+[finding]
+# `file` reads a JSON Lines file and remembers how far it was consumed.
+source = "file"
+file = "~/audit/findings.jsonl"
+# `command` runs once per cycle and reads JSON Lines from stdout instead.
+# source = "command"
+# command = "/usr/local/bin/my-audit"
+# args = ["--jsonl", "--since", "HEAD~1"]
+max_message_bytes = 48000
+
+[log]
+level = "info"
+# file = "~/Library/Application Support/zed-audit-loop/daemon.jsonl"
+stderr = true
