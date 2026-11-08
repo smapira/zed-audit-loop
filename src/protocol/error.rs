@@ -61,12 +61,6 @@ pub enum ClientError {
         status: Status,
         error: Option<ErrorBody>,
     },
-    /// A request was refused. The bridge answered, but the answer forbids the
-    /// operation rather than describing a result.
-    Rejected {
-        status: Status,
-        error: Option<ErrorBody>,
-    },
 }
 
 impl ClientError {
@@ -84,7 +78,6 @@ impl ClientError {
             // request, so the caller must reconcile instead of assuming.
             Self::UnexpectedEof { .. } => false,
             Self::WatchRejected { .. } => false,
-            Self::Rejected { .. } => false,
         }
     }
 
@@ -96,7 +89,7 @@ impl ClientError {
             Self::UnexpectedEof { stage } => Some(*stage),
             Self::Disconnected | Self::LineTooLarge { .. } => Some(ClientStage::Read),
             Self::MalformedResponse { .. } | Self::Encode(_) => None,
-            Self::WatchRejected { .. } | Self::Rejected { .. } => None,
+            Self::WatchRejected { .. } => None,
         }
     }
 
@@ -147,14 +140,6 @@ impl fmt::Display for ClientError {
                     error.code
                 ),
                 None => write!(formatter, "bridge refused to watch: {status}"),
-            },
-            Self::Rejected { status, error } => match error {
-                Some(error) => write!(
-                    formatter,
-                    "bridge refused the request: {status}/{}",
-                    error.code
-                ),
-                None => write!(formatter, "bridge refused the request: {status}"),
             },
         }
     }

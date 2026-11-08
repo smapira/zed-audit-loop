@@ -10,7 +10,7 @@ use tokio::time::timeout;
 
 use super::MAX_LINE_BYTES;
 use super::error::{ClientError, ClientStage};
-use super::types::{Request, Response, Status, ThreadEvent, ThreadSummary, ThreadTarget};
+use super::types::{Request, Response, Status, ThreadEvent};
 
 /// Everything needed to reach one bridge socket.
 #[derive(Debug, Clone)]
@@ -323,22 +323,6 @@ impl BridgeClient {
             .await
     }
 
-    /// Convenience for the CLI: the thread list, or the rejection that stopped
-    /// it.
-    pub async fn try_list_threads(
-        &mut self,
-        request_id: &str,
-    ) -> Result<Vec<ThreadSummary>, ClientError> {
-        let response = self.list_threads(request_id).await?;
-        if response.is_rejection() {
-            return Err(ClientError::Rejected {
-                status: response.status,
-                error: response.error,
-            });
-        }
-        Ok(response.threads.unwrap_or_default())
-    }
-
     /// `watch_thread` on its own connection, which stays open for the life of
     /// the [`Subscription`].
     pub async fn watch(
@@ -461,11 +445,6 @@ impl Subscription {
                 return Ok(Some(event));
             }
         }
-    }
-
-    /// Builds the target used as a `ThreadTarget` for logs.
-    pub fn target(&self) -> ThreadTarget {
-        ThreadTarget::ThreadId(self.thread_id.clone())
     }
 }
 
