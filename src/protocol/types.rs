@@ -500,7 +500,7 @@ impl Request {
         let line = serde_json::to_string(&object)
             .map_err(|error| crate::protocol::ClientError::Encode(error.to_string()))?;
         if line.len() > MAX_LINE_BYTES {
-            return Err(crate::protocol::ClientError::LineTooLarge {
+            return Err(crate::protocol::ClientError::RequestTooLarge {
                 bytes: line.len(),
                 limit: MAX_LINE_BYTES,
             });
@@ -549,7 +549,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            crate::protocol::ClientError::LineTooLarge { .. }
+            crate::protocol::ClientError::RequestTooLarge { .. }
         ));
     }
 

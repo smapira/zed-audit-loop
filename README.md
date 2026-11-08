@@ -119,7 +119,7 @@ zed-audit-loop --config config.toml run
 
 | ファイル | 内容 |
 | --- | --- |
-| `ledger.jsonl` | 送信台帳。**送信前に書く**（write-ahead）。`request_id`・送信内容・最終状態 |
+| `ledger.jsonl` | 送信台帳。**送信前に書く**（write-ahead）。`request_id`・送信内容・最終状態。`error_code` が `local:` で始まる場合はデーモン自身の理由（`local:transport` など） |
 | `events/<thread>.jsonl` | 受信した全イベント（`entry.text` 含む。購読は過去を再生しないため必須） |
 | `turns/<thread>.jsonl` | ターン完了ごとに、エージェントの応答本文を連結して 1 行 |
 | `findings.cursor.json` | 監査結果ファイルのどこまで消費したか |
@@ -201,7 +201,7 @@ pub trait FindingSource {
 ## 11. テスト
 
 ```sh
-cargo test          # 95 tests: lib 57 / daemon_cycle 22 / protocol_conformance 16
+cargo test          # 101 tests: lib 63 / daemon_cycle 22 / protocol_conformance 16
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```

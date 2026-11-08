@@ -242,7 +242,7 @@ async fn an_oversized_message_is_refused_without_touching_the_socket() {
         .await
         .expect_err("must refuse locally");
 
-    assert!(matches!(error, ClientError::LineTooLarge { .. }));
+    assert!(matches!(error, ClientError::RequestTooLarge { .. }));
     assert!(bridge.requests_for("send_message").is_empty());
     assert!(bridge.requests().is_empty());
 }

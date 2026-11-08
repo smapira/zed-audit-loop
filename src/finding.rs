@@ -265,9 +265,10 @@ pub fn render_batches(findings: &[Finding], max_bytes: usize) -> Vec<String> {
         return Vec::new();
     }
 
-    // Every message carries the header, so the blocks only get what is left. The
-    // extra room covers the `（1/7）` part marker growing with the batch count.
-    let header_room = render_message(&[], 1, 99).len();
+    // The bridge limits the encoded line, not the text, and every newline or
+    // quote in a message takes two bytes once escaped. Sizing on the encoded form
+    // is what keeps a message under the limit.
+    let header_room = wire_len(&render_message(&[], 1, 99));
     let budget = max_bytes.saturating_sub(header_room).max(1);
 
     let mut batches: Vec<Vec<String>> = Vec::new();
@@ -275,13 +276,13 @@ pub fn render_batches(findings: &[Finding], max_bytes: usize) -> Vec<String> {
     let mut current_len = 0usize;
     for finding in findings {
         let mut block = render_finding(finding);
-        if block.len() > budget {
+        if wire_len(&block) > budget {
             // One finding can be larger than a whole message. Truncating it is
             // better than failing the send forever: the send would be refused
             // locally and the finding would never be consumed.
             block = truncate_block(block, budget);
         }
-        let block_len = block.len();
+        let block_len = wire_len(&block);
         if !current.is_empty() && current_len + block_len > budget {
             batches.push(std::mem::take(&mut current));
             current_len = 0;
@@ -316,21 +317,37 @@ pub fn render_message(blocks: &[String], part: usize, parts: usize) -> String {
     message
 }
 
+/// The size a string occupies inside a JSON line.
+fn wire_len(text: &str) -> usize {
+    serde_json::to_string(text).map_or(text.len(), |encoded| encoded.len())
+}
+
 /// Shortens one oversized finding so it fits a message on its own.
-fn truncate_block(block: String, budget: usize) -> String {
+///
+/// The target is in encoded bytes, so the search halves the raw length until the
+/// escaped form fits; it converges in a handful of steps and never splits a
+/// multi-byte character.
+fn truncate_block(mut block: String, budget: usize) -> String {
     const MARKER: &str = "\n  ...(truncated)\n";
-    if block.len() <= budget {
+    if wire_len(&block) <= budget {
         return block;
     }
-    let mut end = budget.saturating_sub(MARKER.len());
-    // Never split a multi-byte character.
-    while end > 0 && !block.is_char_boundary(end) {
-        end -= 1;
+    let target = budget.saturating_sub(wire_len(MARKER));
+
+    let mut end = target.min(block.len());
+    loop {
+        while end > 0 && !block.is_char_boundary(end) {
+            end -= 1;
+        }
+        if wire_len(block.get(..end).unwrap_or_default()) <= target || end == 0 {
+            break;
+        }
+        end /= 2;
     }
-    let mut truncated = block;
-    truncated.truncate(end);
-    truncated.push_str(MARKER);
-    truncated
+
+    block.truncate(end);
+    block.push_str(MARKER);
+    block
 }
 
 /// One finding as a bullet.
@@ -543,6 +560,30 @@ mod tests {
         assert!(!batches[0].contains('\u{fffd}'));
         assert!(batches[0].contains("truncated"));
         assert!(batches[0].contains("日本語"));
+    }
+
+    #[test]
+    fn a_message_of_many_newlines_fits_the_encoded_budget() {
+        // Newlines double once JSON-escaped, which is what used to push a
+        // message past the bridge's 64 KiB line limit.
+        let wordy = Finding {
+            id: String::new(),
+            severity: Severity::Info,
+            summary: "many short lines".into(),
+            detail: Some("one line\n".repeat(4_000)),
+            location: None,
+        };
+
+        let batches = render_batches(&[wordy], 4_000);
+
+        assert!(!batches.is_empty());
+        for batch in &batches {
+            assert!(
+                wire_len(batch) <= 4_000,
+                "encoded batch is {} bytes",
+                wire_len(batch)
+            );
+        }
     }
 
     #[test]

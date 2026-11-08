@@ -48,8 +48,11 @@ pub enum ClientError {
     },
     /// The stage did not finish in time.
     Timeout { stage: ClientStage, after: Duration },
-    /// A line exceeded the 64 KiB bridge limit.
+    /// A line exceeded the 64 KiB bridge limit: a response we could not read.
     LineTooLarge { bytes: usize, limit: usize },
+    /// The request would not fit in one bridge line. Detected before writing, so
+    /// the bridge certainly never saw it.
+    RequestTooLarge { bytes: usize, limit: usize },
     /// The bridge closed the connection without answering.
     UnexpectedEof { stage: ClientStage },
     /// The line was not UTF-8 or not a response object.
@@ -71,9 +74,12 @@ impl ClientError {
             | Self::Disconnected
             | Self::Timeout { .. }
             | Self::Io { .. } => true,
-            // The bridge answered with a line we cannot decode; a retry with the
-            // same bytes would fail the same way.
-            Self::LineTooLarge { .. } | Self::MalformedResponse { .. } | Self::Encode(_) => false,
+            // The bridge answered with a line we cannot decode, or the request
+            // cannot be encoded; a retry with the same bytes fails the same way.
+            Self::LineTooLarge { .. }
+            | Self::RequestTooLarge { .. }
+            | Self::MalformedResponse { .. }
+            | Self::Encode(_) => false,
             // The bridge closed without answering: it may have processed the
             // request, so the caller must reconcile instead of assuming.
             Self::UnexpectedEof { .. } => false,
@@ -88,7 +94,7 @@ impl ClientError {
             Self::Io { stage, .. } | Self::Timeout { stage, .. } => Some(*stage),
             Self::UnexpectedEof { stage } => Some(*stage),
             Self::Disconnected | Self::LineTooLarge { .. } => Some(ClientStage::Read),
-            Self::MalformedResponse { .. } | Self::Encode(_) => None,
+            Self::RequestTooLarge { .. } | Self::MalformedResponse { .. } | Self::Encode(_) => None,
             Self::WatchRejected { .. } => None,
         }
     }
@@ -120,7 +126,13 @@ impl fmt::Display for ClientError {
             Self::LineTooLarge { bytes, limit } => {
                 write!(
                     formatter,
-                    "line of {bytes} bytes exceeds the {limit} byte limit"
+                    "response line of {bytes} bytes exceeds the {limit} byte limit"
+                )
+            }
+            Self::RequestTooLarge { bytes, limit } => {
+                write!(
+                    formatter,
+                    "request line of {bytes} bytes exceeds the {limit} byte limit; split the message"
                 )
             }
             Self::UnexpectedEof { stage } => {

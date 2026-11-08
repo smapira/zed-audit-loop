@@ -26,14 +26,23 @@ use crate::finding::{
 use crate::ledger::{Ledger, LedgerState};
 use crate::logging::Logger;
 use crate::protocol::{
-    BridgeClient, ErrorCode, EventKind, RecommendedAction, Status, Subscription, ThreadState,
-    ThreadStatusInfo,
+    BridgeClient, ErrorCode, EventKind, RecommendedAction, Status, Subscription, ThreadEvent,
+    ThreadState, ThreadStatusInfo,
 };
 use crate::store::{Store, TurnCapture, is_finished_state};
 use crate::time::unix_millis;
 
 /// File under the storage directory that remembers how many findings were read.
 pub const FINDINGS_CURSOR_FILE: &str = "findings.cursor.json";
+
+/// Error values the daemon records for its own failures. They are prefixed so an
+/// operator can tell them from codes the bridge sends, and so they can never be
+/// mistaken for a code the bridge records in its ledger.
+pub const LOCAL_ERROR_TRANSPORT: &str = "local:transport";
+/// The bridge answered with a status a send cannot have.
+pub const LOCAL_ERROR_UNEXPECTED_STATUS: &str = "local:unexpected_status";
+/// The send was written but its outcome was lost.
+pub const LOCAL_ERROR_OUTCOME_UNKNOWN: &str = "local:outcome_unknown";
 
 /// How many times one turn may lose its watch before the cycle gives up. A
 /// bridge that keeps dropping the subscription must not turn the response wait
@@ -629,7 +638,7 @@ impl Daemon {
                         }
                     }
                     Status::Accepted | Status::Event | Status::Other(_) => {
-                        self.finish_rejected(&request_id, "unexpected_status");
+                        self.finish_rejected(&request_id, LOCAL_ERROR_UNEXPECTED_STATUS);
                         return SendOutcome::Deferred(format!(
                             "unexpected send status {}",
                             response.status
@@ -639,7 +648,7 @@ impl Daemon {
                 Err(error) => {
                     if error.never_reached_bridge() {
                         // The bytes never arrived, so the id is still unused.
-                        self.finish_rejected(&request_id, "transport");
+                        self.finish_rejected(&request_id, LOCAL_ERROR_TRANSPORT);
                         self.logger.warn(
                             "send_transport_error",
                             &[
@@ -658,7 +667,7 @@ impl Daemon {
                             &request_id,
                             LedgerState::Unknown,
                             None,
-                            Some("outcome_unknown".to_string()),
+                            Some(LOCAL_ERROR_OUTCOME_UNKNOWN.to_string()),
                         ) {
                             return SendOutcome::Failed(format!(
                                 "writing the ledger failed: {ledger_error:#}"
@@ -889,27 +898,36 @@ impl Daemon {
                                         &[("cycle_id", cycle_id), ("thread_id", thread_id)],
                                     );
                                 }
-                                if is_finished_state(state)
-                                    && (seen_generating || capture.saw_agent_text())
+                                if turn_finishes(&event, seen_generating, capture.saw_agent_text())
                                 {
                                     let subscription = self.subscription.take();
-                                    let outcome =
-                                        self.complete_turn(thread_id, request_id, capture, None);
+                                    let outcome = self.complete_turn(
+                                        thread_id,
+                                        request_id,
+                                        capture,
+                                        event.detail.clone(),
+                                    );
                                     self.subscription = subscription;
                                     return outcome;
                                 }
                             }
                         }
                         EventKind::TurnStopped => {
-                            let subscription = self.subscription.take();
-                            let outcome = self.complete_turn(
-                                thread_id,
-                                request_id,
-                                capture,
-                                event.detail.clone(),
+                            if turn_finishes(&event, seen_generating, capture.saw_agent_text()) {
+                                let subscription = self.subscription.take();
+                                let outcome = self.complete_turn(
+                                    thread_id,
+                                    request_id,
+                                    capture,
+                                    event.detail.clone(),
+                                );
+                                self.subscription = subscription;
+                                return outcome;
+                            }
+                            self.logger.debug(
+                                "turn_stopped_ignored",
+                                &[("cycle_id", cycle_id), ("thread_id", thread_id)],
                             );
-                            self.subscription = subscription;
-                            return outcome;
                         }
                         EventKind::ToolAuthorizationRequested => {
                             self.logger.warn(
@@ -1101,7 +1119,96 @@ fn build_source(
     }
 }
 
+/// Whether an event ends the turn the daemon is waiting for.
+///
+/// An event only counts once the turn has shown a sign of life: `generating`, or
+/// agent text. Without that guard, an event left over from an earlier turn (the
+/// stream is not replayed but it is also not filtered) could end the wrong turn
+/// and record an empty answer against the new `request_id`.
+fn turn_finishes(event: &ThreadEvent, seen_generating: bool, has_agent_text: bool) -> bool {
+    let alive = seen_generating || has_agent_text;
+    match &event.kind {
+        EventKind::TurnStopped => alive,
+        EventKind::StatusChanged => alive && event.state.as_ref().is_some_and(is_finished_state),
+        _ => false,
+    }
+}
+
 /// Parses `"start..end"` from an `entry_removed` event.
 fn parse_removed_index(detail: &str) -> Option<u64> {
     detail.split("..").next()?.trim().parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(kind: EventKind, state: Option<&str>) -> ThreadEvent {
+        ThreadEvent {
+            watch_id: "watch".into(),
+            thread_id: "thread-a".into(),
+            kind,
+            entry: None,
+            state: state.map(ThreadState::from_wire),
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn a_stale_stop_does_not_end_a_turn_that_never_started() {
+        let stopped = event(EventKind::TurnStopped, None);
+        assert!(!turn_finishes(&stopped, false, false));
+
+        let idle = event(EventKind::StatusChanged, Some("idle"));
+        assert!(!turn_finishes(&idle, false, false));
+    }
+
+    #[test]
+    fn a_stop_ends_a_turn_that_showed_life() {
+        let stopped = event(EventKind::TurnStopped, None);
+        assert!(turn_finishes(&stopped, true, false));
+        assert!(turn_finishes(&stopped, false, true));
+    }
+
+    #[test]
+    fn only_idle_ends_a_turn_through_a_state_change() {
+        assert!(turn_finishes(
+            &event(EventKind::StatusChanged, Some("idle")),
+            true,
+            false
+        ));
+        assert!(!turn_finishes(
+            &event(EventKind::StatusChanged, Some("generating")),
+            true,
+            false
+        ));
+        assert!(!turn_finishes(
+            &event(EventKind::StatusChanged, Some("awaiting_approval")),
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn other_events_never_end_a_turn() {
+        for kind in [
+            EventKind::EntryAdded,
+            EventKind::EntryUpdated,
+            EventKind::EntryRemoved,
+            EventKind::TitleUpdated,
+            EventKind::ToolAuthorizationRequested,
+        ] {
+            assert!(
+                !turn_finishes(&event(kind.clone(), None), true, true),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_entry_removal_detail_is_parsed() {
+        assert_eq!(parse_removed_index("4..7"), Some(4));
+        assert_eq!(parse_removed_index("9"), Some(9));
+        assert_eq!(parse_removed_index("x..y"), None);
+    }
 }
