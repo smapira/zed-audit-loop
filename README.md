@@ -17,7 +17,10 @@ Zed の外部スレッドメッセージブリッジ（Unix domain socket / NDJS
 ```
 1. 対象スレッドを決める（明示 thread_id / list_threads で最新を選ぶ）
 2. 専用接続で watch_thread          → 以後この接続にイベントが流れる
-3. get_thread_status                → state を確認（awaiting_approval なら送らずに待つ）
+3. get_thread_status                → state を確認
+   - awaiting_approval なら送らずに待つ（迂回しない）
+   - generating / unconfirmed なら送らずに次のサイクルへ（実行中のターンの回答を
+     自分の回答として記録しないため）
 4. send_message（mode: prompt）     → delivered / queued
 5. イベントを読む                   → status_changed / entry_added / turn_stopped …
 6. entry.text から応答本文を組み立てて保存
@@ -183,7 +186,16 @@ pub trait FindingSource {
 - ターン完了は「`generating` を観測」または「エージェント本文を受信」した後の
   `idle` / `turn_stopped` で判定します（前のターンの取り残しイベントで誤って終わらせないため）。
   本文も `generating` も出ない空応答のターンは `await_response_secs` まで待つことがあります。
-- `ledger.jsonl` は追記のみで、自動では削除しません（ローテートは人手）。
+- **`generating` 中は送らない**方針です（キュー登録はせず次のサイクルへ）。ブリッジは
+  `queued` を受け付けますが、その場合「実行中のターンの回答」を自分の回答として
+  記録してしまうため、`idle` を待ちます。万一 `queued` になった場合は、先行ターンの
+  終了（`idle` / `turn_stopped`）を境界として、それ以前のイベントを本文に取り込みません。
+- イベント行の読み取り上限は 4 MiB（`MAX_EVENT_LINE_BYTES`）。ブリッジが書く行の長さは
+  仕様で制限されていないため、応答行の 64 KiB 上限とは別にしています。超えた行は
+  **その行だけ**捨てて購読を維持し、`line_too_large` イベントとして記録・警告します。
+- 同一ストレージディレクトリの二重起動は `daemon.lock`（flock）で拒否します。
+- `ledger.jsonl` は追記のみで、自動では削除しません（ローテートは人手）。クラッシュで
+  末尾改行が欠けた場合は、次の書き込みで改行を補ってから追記します。
 - 1 件の `Finding` が `max_message_bytes` を超える場合は、その指摘だけを切り詰めて送ります
   （未送信のまま永久にリトライするより、切り詰めて届ける方を選ぶ）。
 - 復元時に Zed の Agent Panel 表示が対象スレッドへ切り替わる場合があります（ブリッジ側の性質）。
@@ -204,7 +216,7 @@ pub trait FindingSource {
 ## 11. テスト
 
 ```sh
-cargo test          # 101 tests: lib 63 / daemon_cycle 22 / protocol_conformance 16
+cargo test          # 125 tests: lib 73 / daemon_cycle 29 / protocol_conformance 23
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```
