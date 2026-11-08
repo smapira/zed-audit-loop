@@ -11,6 +11,255 @@ use zed_audit_loop::protocol::{
     BridgeClient, ClientConfig, ClientError, ErrorCode, EventKind, Status, ThreadState,
 };
 
+#[tokio::test]
+async fn every_documented_event_kind_decodes() {
+    use zed_audit_loop::protocol::{EntrySummary, ThreadEvent};
+
+    let bridge = FakeBridge::start(Script {
+        thread: Some(ThreadFacts::idle("thread-a")),
+        ..Script::default()
+    });
+    let mut client = client(&bridge);
+    let mut subscription = client.watch("watch-1", "thread-a").await.expect("accepted");
+
+    let entry = Some(EntrySummary {
+        index: 4,
+        kind: "assistant_message".into(),
+        text: Some("text".into()),
+    });
+    let events = vec![
+        ThreadEvent {
+            watch_id: "watch-1".into(),
+            thread_id: "thread-a".into(),
+            kind: EventKind::EntryUpdated,
+            entry: entry.clone(),
+            state: None,
+            detail: None,
+        },
+        ThreadEvent {
+            watch_id: "watch-1".into(),
+            thread_id: "thread-a".into(),
+            kind: EventKind::EntryRemoved,
+            entry: None,
+            state: None,
+            detail: Some("4..5".into()),
+        },
+        ThreadEvent {
+            watch_id: "watch-1".into(),
+            thread_id: "thread-a".into(),
+            kind: EventKind::TitleUpdated,
+            entry: None,
+            state: None,
+            detail: Some("new title".into()),
+        },
+        ThreadEvent {
+            watch_id: "watch-1".into(),
+            thread_id: "thread-a".into(),
+            kind: EventKind::ToolAuthorizationRequested,
+            entry: None,
+            state: None,
+            detail: Some("run tests".into()),
+        },
+        ThreadEvent {
+            watch_id: "watch-1".into(),
+            thread_id: "thread-a".into(),
+            kind: EventKind::ToolAuthorizationReceived,
+            entry: None,
+            state: None,
+            detail: Some("allowed".into()),
+        },
+    ];
+    bridge.push_events("thread-a", &events);
+
+    let mut seen = Vec::new();
+    for _ in 0..events.len() {
+        let event = tokio::time::timeout(Duration::from_secs(2), subscription.next_event())
+            .await
+            .expect("event arrives")
+            .expect("no watch error")
+            .expect("stream open");
+        seen.push(event.kind.clone());
+    }
+
+    assert_eq!(
+        seen,
+        vec![
+            EventKind::EntryUpdated,
+            EventKind::EntryRemoved,
+            EventKind::TitleUpdated,
+            EventKind::ToolAuthorizationRequested,
+            EventKind::ToolAuthorizationReceived,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_event_kind_does_not_break_the_stream() {
+    let bridge = FakeBridge::start(Script {
+        thread: Some(ThreadFacts::idle("thread-a")),
+        ..Script::default()
+    });
+    let mut client = client(&bridge);
+    let mut subscription = client.watch("watch-1", "thread-a").await.expect("accepted");
+
+    bridge.push_line(
+        r#"{"version":1,"request_id":"watch-1","thread_id":"thread-a",
+            "status":"event",
+            "event":{"watch_id":"watch-1","thread_id":"thread-a",
+                      "kind":"future_kind","detail":"?"}}"#
+            .replace('\n', "")
+            .as_str(),
+    );
+
+    let event = tokio::time::timeout(Duration::from_secs(2), subscription.next_event())
+        .await
+        .expect("event arrives")
+        .expect("no error")
+        .expect("stream open");
+
+    assert_eq!(event.kind, EventKind::Other("future_kind".into()));
+}
+
+#[tokio::test]
+async fn a_rejection_on_the_watch_stream_is_reported() {
+    let bridge = FakeBridge::start(Script {
+        thread: Some(ThreadFacts::idle("thread-a")),
+        ..Script::default()
+    });
+    let mut client = client(&bridge);
+    let mut subscription = client.watch("watch-1", "thread-a").await.expect("accepted");
+
+    bridge.push_line(
+        r#"{"version":1,"request_id":"watch-1","status":"rejected",
+            "error":{"code":"queue_full"}}"#
+            .replace('\n', "")
+            .as_str(),
+    );
+
+    let error = tokio::time::timeout(Duration::from_secs(2), subscription.next_event())
+        .await
+        .expect("answered")
+        .expect_err("must not be skipped silently");
+
+    assert!(matches!(
+        error,
+        ClientError::WatchRejected {
+            status: Status::Rejected,
+            error: Some(ref body),
+        } if body.code == ErrorCode::QueueFull
+    ));
+}
+
+#[tokio::test]
+async fn a_long_event_line_is_discarded_without_losing_the_subscription() {
+    let bridge = FakeBridge::start(Script {
+        thread: Some(ThreadFacts::idle("thread-a")),
+        ..Script::default()
+    });
+    let mut client = client(&bridge);
+    let mut subscription = client.watch("watch-1", "thread-a").await.expect("accepted");
+
+    // A message bigger than the read ceiling, then a normal event.
+    let huge = "y".repeat(zed_audit_loop::protocol::MAX_EVENT_LINE_BYTES + 1_024);
+    let oversized = serde_json::json!({
+        "version": 1,
+        "request_id": "watch-1",
+        "thread_id": "thread-a",
+        "status": "event",
+        "event": {
+            "watch_id": "watch-1",
+            "thread_id": "thread-a",
+            "kind": "entry_added",
+            "entry": { "index": 1, "kind": "assistant_message", "text": huge },
+        }
+    })
+    .to_string();
+    // Both lines go out from one thread: the oversized write blocks until the
+    // client reads, so a second write from the test thread would deadlock.
+    bridge.push_lines_detached(vec![
+        oversized,
+        serde_json::json!({
+            "version": 1,
+            "request_id": "watch-1",
+            "thread_id": "thread-a",
+            "status": "event",
+            "event": {
+                "watch_id": "watch-1",
+                "thread_id": "thread-a",
+                "kind": "status_changed",
+                "state": "idle",
+            }
+        })
+        .to_string(),
+    ]);
+
+    let skipped = tokio::time::timeout(Duration::from_secs(10), subscription.next_event())
+        .await
+        .expect("answered")
+        .expect("no error")
+        .expect("stream open");
+    assert_eq!(
+        skipped.kind,
+        EventKind::Other(zed_audit_loop::protocol::LINE_TOO_LARGE_EVENT.into())
+    );
+
+    let next = tokio::time::timeout(Duration::from_secs(2), subscription.next_event())
+        .await
+        .expect("answered")
+        .expect("no error")
+        .expect("stream open");
+    assert_eq!(next.kind, EventKind::StatusChanged);
+    assert_eq!(subscription.skipped_lines(), 1);
+}
+
+#[tokio::test]
+async fn a_bridge_disabled_rejection_carries_no_request_id() {
+    let bridge = FakeBridge::start(Script {
+        reject_next_request: Some(ErrorCode::BridgeDisabled),
+        blank_request_id: true,
+        ..Script::default()
+    });
+    let mut client = client(&bridge);
+
+    let response = client.list_threads("list-1").await.expect("answered");
+
+    assert_eq!(response.status, Status::Rejected);
+    assert_eq!(response.error_code(), Some(&ErrorCode::BridgeDisabled));
+    assert_eq!(response.request_id, "");
+}
+
+#[tokio::test]
+async fn duplicate_request_is_reported_as_already_handled() {
+    let bridge = FakeBridge::start(Script {
+        reject_next_request: Some(ErrorCode::DuplicateRequest),
+        ..Script::default()
+    });
+    let mut client = client(&bridge);
+
+    let response = client
+        .send_message("audit-1", "thread-a", "hello")
+        .await
+        .expect("answered");
+
+    assert_eq!(response.error_code(), Some(&ErrorCode::DuplicateRequest));
+}
+
+#[tokio::test]
+async fn an_invalid_request_rejection_is_surfaced() {
+    let bridge = FakeBridge::start(Script {
+        reject_next_request: Some(ErrorCode::InvalidRequest),
+        ..Script::default()
+    });
+    let mut client = client(&bridge);
+
+    let response = client
+        .send_message("audit-1", "thread-a", "hello")
+        .await
+        .expect("answered");
+
+    assert_eq!(response.error_code(), Some(&ErrorCode::InvalidRequest));
+}
+
 fn client(bridge: &FakeBridge) -> BridgeClient {
     let mut config = ClientConfig::new(bridge.path());
     config.connect_timeout = Duration::from_millis(500);

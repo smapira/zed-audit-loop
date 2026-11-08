@@ -15,8 +15,8 @@ use std::thread::{self, JoinHandle};
 
 use serde_json::{Value, json};
 use zed_audit_loop::protocol::{
-    ErrorBody, ErrorCode, PROTOCOL_VERSION, Response, Status, ThreadEvent, ThreadStatusInfo,
-    ThreadSummary,
+    DeliveryRecord, ErrorBody, ErrorCode, PROTOCOL_VERSION, Response, Status, ThreadEvent,
+    ThreadStatusInfo, ThreadSummary,
 };
 
 /// One received request line, decoded just enough for assertions.
@@ -271,6 +271,11 @@ pub struct Script {
     pub close_after_request: bool,
     /// Refuse the next request of any action, then clear itself.
     pub reject_next_request: Option<ErrorCode>,
+    /// Answer `get_delivery_status` with this record instead of `unknown_request`.
+    pub delivery: Option<DeliveryRecord>,
+    /// Send rejections without a `request_id`, as the real bridge does for
+    /// `message_too_large` and `bridge_disabled`.
+    pub blank_request_id: bool,
     /// Answer the next request with a line that is not JSON, then clear itself.
     pub malformed_next_reply: bool,
     /// Drop the watcher sockets right after streaming a send's events, which is
@@ -400,6 +405,57 @@ impl FakeBridge {
     /// watched thread changes.
     pub fn push_events(&self, thread_id: &str, events: &[ThreadEvent]) {
         push_events(&self.watchers, thread_id, events);
+    }
+
+    /// Writes a raw line to every registered watcher, so a test can inject
+    /// replies the scripted events do not produce.
+    pub fn push_line(&self, line: &str) -> usize {
+        let sinks: Vec<Arc<Mutex<UnixStream>>> = self
+            .watchers
+            .lock()
+            .expect("watchers")
+            .iter()
+            .map(Arc::clone)
+            .collect();
+        let mut written = 0;
+        for sink in &sinks {
+            let Ok(mut stream) = sink.lock() else {
+                continue;
+            };
+            if stream.write_all(line.as_bytes()).is_ok()
+                && stream.write_all(b"\n").is_ok()
+                && stream.flush().is_ok()
+            {
+                written += 1;
+            }
+        }
+        written
+    }
+
+    /// Writes raw lines, in order, from a detached thread.
+    ///
+    /// A line bigger than the socket buffer cannot be written while the client is
+    /// not reading yet, so the write has to race with the read.
+    pub fn push_lines_detached(&self, lines: Vec<String>) {
+        let sinks: Vec<Arc<Mutex<UnixStream>>> = self
+            .watchers
+            .lock()
+            .expect("watchers")
+            .iter()
+            .map(Arc::clone)
+            .collect();
+        std::thread::spawn(move || {
+            for sink in &sinks {
+                let Ok(mut stream) = sink.lock() else {
+                    continue;
+                };
+                for line in &lines {
+                    let _ = stream.write_all(line.as_bytes());
+                    let _ = stream.write_all(b"\n");
+                    let _ = stream.flush();
+                }
+            }
+        });
     }
 
     /// Stops accepting connections.
@@ -560,7 +616,12 @@ fn serve_connection(
                 continue;
             }
             if let Some(code) = script.reject_next_request.take() {
-                let response = send_status_with_error(&request.request_id, &code, Status::Rejected);
+                let request_id = if script.blank_request_id {
+                    String::new()
+                } else {
+                    request.request_id.clone()
+                };
+                let response = send_status_with_error(&request_id, &code, Status::Rejected);
                 let _ = write_response(&mut writer, &response);
                 continue;
             }
@@ -627,20 +688,34 @@ fn serve_connection(
                     let thread_id = request.thread_id.clone().unwrap_or_default();
                     reply.to_response(&request.request_id, &thread_id)
                 }
-                "get_delivery_status" => Response {
-                    version: PROTOCOL_VERSION,
-                    request_id: request.request_id.clone(),
-                    thread_id: None,
-                    status: Status::Rejected,
-                    message_id: None,
-                    error: Some(ErrorBody {
-                        code: ErrorCode::UnknownRequest,
-                        detail: Some("no delivery is tracked".to_string()),
-                    }),
-                    threads: None,
-                    thread: None,
-                    delivery: None,
-                    event: None,
+                "get_delivery_status" => match script.delivery.clone() {
+                    Some(delivery) => Response {
+                        version: PROTOCOL_VERSION,
+                        request_id: request.request_id.clone(),
+                        thread_id: delivery.thread_id.clone(),
+                        status: Status::Accepted,
+                        message_id: None,
+                        error: None,
+                        threads: None,
+                        thread: None,
+                        delivery: Some(delivery),
+                        event: None,
+                    },
+                    None => Response {
+                        version: PROTOCOL_VERSION,
+                        request_id: request.request_id.clone(),
+                        thread_id: None,
+                        status: Status::Rejected,
+                        message_id: None,
+                        error: Some(ErrorBody {
+                            code: ErrorCode::UnknownRequest,
+                            detail: Some("no delivery is tracked".to_string()),
+                        }),
+                        threads: None,
+                        thread: None,
+                        delivery: None,
+                        event: None,
+                    },
                 },
                 other => send_status_with_error(
                     &request.request_id,

@@ -139,8 +139,14 @@ async fn a_cycle_sends_findings_and_stores_the_answer() {
     assert!(message.contains("mismatch"));
     assert!(sends[0].request_id.starts_with("audit-"));
 
-    // The watcher was opened before the send, on its own connection.
+    // The watcher was opened before the send, on its own connection: the queries
+    // and the send share the pooled one, the watch cannot.
     assert_eq!(harness.bridge.requests_for("watch_thread").len(), 1);
+    assert_eq!(harness.bridge.requests_for("get_thread_status").len(), 1);
+    assert!(
+        harness.bridge.connections() >= 2,
+        "the watch needs its own connection"
+    );
 
     // The events and the answer are on disk.
     let events = harness.read_state_file(&format!("events/{THREAD}.jsonl"));
@@ -750,6 +756,244 @@ async fn events_from_before_the_send_are_not_taken_as_the_answer() {
     // It is still recorded as an event, so nothing is silently lost.
     let events = harness.read_state_file(&format!("events/{THREAD}.jsonl"));
     assert!(events.contains("stale answer"));
+}
+
+#[tokio::test]
+async fn a_busy_agent_is_not_messaged() {
+    let mut facts = ThreadFacts::idle(THREAD);
+    facts.state = "generating".to_string();
+    let harness = Harness::new(
+        Script {
+            thread: Some(facts),
+            ..Script::default()
+        },
+        &[&finding("while busy")],
+    );
+    let mut daemon = harness.daemon();
+
+    let outcome = daemon.run_once().await;
+
+    assert!(
+        matches!(outcome, CycleOutcome::Deferred(_)),
+        "got {}",
+        outcome.summary()
+    );
+    // Queueing behind a turn the daemon does not control would make that turn's
+    // answer look like the answer to this message.
+    assert!(harness.bridge.requests_for("send_message").is_empty());
+    assert!(harness.bridge.requests_for("watch_thread").is_empty());
+}
+
+#[tokio::test]
+async fn a_queued_send_does_not_take_the_running_turns_answer() {
+    let harness = Harness::new(
+        Script {
+            thread: Some(ThreadFacts::idle(THREAD)),
+            send_replies: vec![SendReply::Queued],
+            // The thread was idle when checked, then started a turn: the events
+            // of that turn arrive before ours, followed by our answer.
+            turn: Some(TurnScript {
+                events: vec![
+                    status_changed(THREAD, "generating"),
+                    entry_added(THREAD, 3, "assistant_message", "their answer"),
+                    status_changed(THREAD, "idle"),
+                    status_changed(THREAD, "generating"),
+                    entry_added(THREAD, 5, "assistant_message", "our answer"),
+                    status_changed(THREAD, "idle"),
+                ],
+            }),
+            ..Script::default()
+        },
+        &[&finding("queued race")],
+    );
+    let mut daemon = harness.daemon();
+
+    let outcome = daemon.run_once().await;
+
+    assert!(
+        matches!(outcome, CycleOutcome::Sent { .. }),
+        "got {}",
+        outcome.summary()
+    );
+    let turns = harness.read_state_file(&format!("turns/{THREAD}.jsonl"));
+    assert!(turns.contains("our answer"), "turns: {turns}");
+    assert!(
+        !turns.contains("their answer"),
+        "the earlier turn's answer must not be attributed to this request: {turns}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_send_status_is_never_resent() {
+    let harness = Harness::new(
+        Script {
+            thread: Some(ThreadFacts::idle(THREAD)),
+            // A status this client does not know: it may mean accepted.
+            send_replies: vec![SendReply::Status(zed_audit_loop::protocol::Status::Other(
+                "accepted_v2".into(),
+            ))],
+            ..Script::default()
+        },
+        &[&finding("unknown status")],
+    );
+    let mut daemon = harness.daemon();
+
+    let first = daemon.run_once().await;
+    assert!(
+        matches!(first, CycleOutcome::Deferred(_)),
+        "got {}",
+        first.summary()
+    );
+    assert!(
+        harness
+            .read_state_file("ledger.jsonl")
+            .contains("\"unknown\"")
+    );
+
+    harness.rewind_findings_cursor();
+    let second = daemon.run_once().await;
+    assert!(
+        matches!(second, CycleOutcome::Idle(_)),
+        "got {}",
+        second.summary()
+    );
+    assert_eq!(harness.bridge.requests_for("send_message").len(), 1);
+}
+
+#[tokio::test]
+async fn a_duplicate_request_counts_as_delivered() {
+    let harness = Harness::new(
+        Script {
+            thread: Some(ThreadFacts::idle(THREAD)),
+            send_replies: vec![SendReply::Rejected(
+                zed_audit_loop::protocol::ErrorCode::DuplicateRequest,
+            )],
+            turn: Some(TurnScript::silent()),
+            ..Script::default()
+        },
+        &[&finding("already there")],
+    );
+    let mut daemon = harness.daemon();
+
+    let outcome = daemon.run_once().await;
+
+    assert!(
+        matches!(outcome, CycleOutcome::Sent { .. }),
+        "got {}",
+        outcome.summary()
+    );
+    // The bridge already had it, so the ledger must say delivered and block a
+    // later resend.
+    let ledger = harness.read_state_file("ledger.jsonl");
+    assert!(ledger.contains("\"delivered\""), "ledger: {ledger}");
+}
+
+#[tokio::test]
+async fn a_protocol_bug_stops_the_daemon_instead_of_looping() {
+    let harness = Harness::new(
+        Script {
+            thread: Some(ThreadFacts::idle(THREAD)),
+            send_replies: vec![SendReply::Rejected(
+                zed_audit_loop::protocol::ErrorCode::InvalidRequest,
+            )],
+            ..Script::default()
+        },
+        &[&finding("client bug")],
+    );
+    let mut daemon = harness.daemon();
+
+    let outcome = daemon.run_once().await;
+
+    assert!(
+        matches!(outcome, CycleOutcome::Stopped(_)),
+        "got {}",
+        outcome.summary()
+    );
+    let sends = harness.bridge.requests_for("send_message");
+    assert_eq!(sends.len(), 1, "a bug must not be retried");
+}
+
+#[tokio::test]
+async fn a_pending_send_is_reconciled_against_the_bridge_ledger() {
+    let harness = Harness::new(
+        Script {
+            thread: Some(ThreadFacts::idle(THREAD)),
+            delivery: Some(zed_audit_loop::protocol::DeliveryRecord {
+                request_id: "audit-pending-0".to_string(),
+                thread_id: Some(THREAD.to_string()),
+                status: zed_audit_loop::protocol::Status::Delivered,
+                message_id: Some("77".to_string()),
+                error: None,
+            }),
+            ..Script::default()
+        },
+        &[&finding("pending")],
+    );
+    // A crash left a send written but unanswered.
+    std::fs::create_dir_all(harness.state_dir()).expect("state dir");
+    std::fs::write(
+        harness.state_dir().join("ledger.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "request_id": "audit-pending-0",
+                "thread_id": THREAD,
+                "content_hash": "deadbeefdeadbeef",
+                "attempt": 0,
+                "cycle_id": "c0-0",
+                "state": "sending",
+                "message_bytes": 10,
+                "recorded_at": "2026-11-08T00:00:00.000Z"
+            })
+        ),
+    )
+    .expect("write ledger");
+
+    let mut daemon = harness.daemon();
+    assert_eq!(daemon.ledger().unanswered().len(), 1);
+
+    daemon.reconcile_pending().await.expect("reconcile");
+
+    assert!(daemon.ledger().unanswered().is_empty());
+    let record = daemon.ledger().get("audit-pending-0").expect("record");
+    assert_eq!(record.state, zed_audit_loop::ledger::LedgerState::Delivered);
+    assert_eq!(record.message_id.as_deref(), Some("77"));
+}
+
+#[tokio::test]
+async fn a_pending_send_the_bridge_forgot_is_marked_unknown() {
+    let harness = Harness::new(script_with_turn("ignored"), &[&finding("gone")]);
+    std::fs::create_dir_all(harness.state_dir()).expect("state dir");
+    std::fs::write(
+        harness.state_dir().join("ledger.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "request_id": "audit-lost-0",
+                "thread_id": THREAD,
+                "content_hash": "feedfacefeedface",
+                "attempt": 0,
+                "cycle_id": "c0-0",
+                "state": "sending",
+                "message_bytes": 10,
+                "recorded_at": "2026-11-08T00:00:00.000Z"
+            })
+        ),
+    )
+    .expect("write ledger");
+
+    let mut daemon = harness.daemon();
+    daemon.reconcile_pending().await.expect("reconcile");
+
+    let record = daemon.ledger().get("audit-lost-0").expect("record");
+    assert_eq!(record.state, zed_audit_loop::ledger::LedgerState::Unknown);
+    // The unknown record still blocks a resend, which is the whole point.
+    assert!(
+        daemon
+            .ledger()
+            .find_blocking(THREAD, "feedfacefeedface")
+            .is_some()
+    );
 }
 
 #[test]
