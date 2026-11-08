@@ -284,6 +284,10 @@ impl Daemon {
                 ("socket", &self.client.socket_path().display().to_string()),
                 ("source", &self.source.describe()),
                 ("ledger_records", &self.ledger.len().to_string()),
+                (
+                    "ledger_skipped_lines",
+                    &self.ledger.skipped_lines().to_string(),
+                ),
             ],
         );
         if let Err(error) = self.reconcile_pending().await {
