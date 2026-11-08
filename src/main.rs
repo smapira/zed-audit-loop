@@ -208,7 +208,9 @@ fn print_threads(threads: &[zed_audit_loop::protocol::ThreadSummary]) {
         println!(
             "{:<38} {:<18} {}{}",
             thread.thread_id,
-            thread.state,
+            // A `Display` impl that writes directly ignores the format width, so
+            // the column only lines up when a `&str` is formatted.
+            thread.state.as_wire(),
             thread.title.as_deref().unwrap_or("(untitled)"),
             archived
         );
