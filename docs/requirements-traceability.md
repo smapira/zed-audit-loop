@@ -19,6 +19,7 @@
 | --- | --- | --- |
 | Unix domain stream、NDJSON（`\n` 区切り） | `protocol::client::LineReader`, `Connection::exchange` | `protocol::client::tests::reads_newline_delimited_lines` |
 | 1 行 64 KiB 上限、超過時 `message_too_large` + 切断 | `protocol::MAX_LINE_BYTES`, `Request::to_line`, `LineReader` | `protocol::client::tests::rejects_lines_over_the_limit`, `tests/protocol_conformance.rs::an_oversized_message_is_refused_without_touching_the_socket`, `a_message_too_large_rejection_is_reported_and_the_client_recovers` |
+| 送信前にエンコード後の長さで上限を守る（JSON エスケープ込み） | `finding::wire_len`（`render_batches` の予算）, `ErrorCode`/`ClientError::RequestTooLarge` | `finding::tests::a_message_of_many_newlines_fits_the_encoded_budget`, `protocol::types::tests::oversized_message_is_refused_before_sending` |
 | 1 接続 100 要求。購読は専用接続 | `ClientConfig::max_requests_per_connection`, `BridgeClient::ensure_connection`, `BridgeClient::watch` | `tests/protocol_conformance.rs::the_client_reopens_after_its_request_budget`, `watching_streams_every_event_kind` |
 | 切り詰められた行を応答として解釈しない | `LineReader::next_line`（EOF 途中は `UnexpectedEof`） | `protocol::client::tests::a_truncated_final_line_is_an_error_not_a_response` |
 
@@ -78,6 +79,7 @@
 | 応答が来ないまま時間切れでも送信は成立させる | `TurnOutcome::TimedOut` | `a_silent_agent_does_not_block_the_next_cycle` |
 | 短いターン（`generating` を観測できない）でも完了する | `Daemon::await_turn`（エージェント本文 + `idle` で完了） | `a_turn_without_a_generating_event_still_finishes` |
 | サイクル間のイベントをターン本文と混同しない | `Daemon::drain_pending_events`（送信前に読み切る） | `events_from_before_the_send_are_not_taken_as_the_answer` |
+| 前のターンの残りイベントが次のターンを終わらせない | `daemon::turn_finishes`（`generating` かエージェント本文を必要条件にする） | `daemon::tests::a_stale_stop_does_not_end_a_turn_that_never_started`, `a_stop_ends_a_turn_that_showed_life`, `only_idle_ends_a_turn_through_a_state_change` |
 
 ## §9 参照実装（CLI）
 
