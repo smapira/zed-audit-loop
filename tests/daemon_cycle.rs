@@ -709,6 +709,49 @@ async fn a_turn_without_a_generating_event_still_finishes() {
     assert!(turns.contains("quick answer"));
 }
 
+#[tokio::test]
+async fn events_from_before_the_send_are_not_taken_as_the_answer() {
+    let harness = Harness::new(script_with_turn("first answer"), &[&finding("first")]);
+    let mut daemon = harness.daemon();
+    let outcome = daemon.run_once().await;
+    assert!(
+        matches!(outcome, CycleOutcome::Sent { .. }),
+        "got {}",
+        outcome.summary()
+    );
+
+    // The agent (or another client) touched the thread while the daemon was idle.
+    harness.bridge.push_events(
+        THREAD,
+        &[
+            status_changed(THREAD, "generating"),
+            entry_added(THREAD, 99, "assistant_message", "stale answer"),
+            status_changed(THREAD, "idle"),
+        ],
+    );
+    std::fs::write(
+        &harness.findings,
+        format!("{}\n{}\n", finding("first"), finding("second")),
+    )
+    .expect("append a finding");
+
+    let outcome = daemon.run_once().await;
+    assert!(
+        matches!(outcome, CycleOutcome::Sent { .. }),
+        "got {}",
+        outcome.summary()
+    );
+
+    let turns = harness.read_state_file(&format!("turns/{THREAD}.jsonl"));
+    assert!(
+        !turns.contains("stale answer"),
+        "a buffered event must not become this turn's answer: {turns}"
+    );
+    // It is still recorded as an event, so nothing is silently lost.
+    let events = harness.read_state_file(&format!("events/{THREAD}.jsonl"));
+    assert!(events.contains("stale answer"));
+}
+
 #[test]
 fn a_config_without_a_target_is_rejected() {
     let config = Config::default();

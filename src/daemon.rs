@@ -334,6 +334,21 @@ impl Daemon {
         };
         self.log_thread_state(cycle_id, &thread_id, &status);
 
+        // Anything the watch buffered since the last cycle belongs to an earlier
+        // turn: it is stored, but must not be mistaken for the answer to the
+        // message this cycle is about to send.
+        let drained = self.drain_pending_events(cycle_id, &thread_id).await;
+        if drained > 0 {
+            self.logger.info(
+                "events_drained",
+                &[
+                    ("cycle_id", cycle_id),
+                    ("thread_id", &thread_id),
+                    ("count", &drained.to_string()),
+                ],
+            );
+        }
+
         if status.archived {
             return CycleOutcome::Deferred("thread is archived".to_string());
         }
@@ -700,6 +715,45 @@ impl Daemon {
             }
         }
         false
+    }
+
+    /// Moves events that arrived between cycles from the socket into the store.
+    ///
+    /// The subscription stays open across cycles, so a thread that changed while
+    /// the daemon was idle has its events waiting. Reading them here keeps the
+    /// event log complete and stops an old answer being mistaken for this turn's.
+    async fn drain_pending_events(&mut self, cycle_id: &str, thread_id: &str) -> usize {
+        let mut drained = 0usize;
+        loop {
+            let Some(mut subscription) = self.subscription.take() else {
+                break;
+            };
+            // A zero-length wait still polls once, so buffered events come out
+            // without ever blocking the cycle.
+            let received = timeout(Duration::from_millis(1), subscription.next_event()).await;
+            match received {
+                Err(_) => {
+                    self.subscription = Some(subscription);
+                    break;
+                }
+                Ok(Ok(Some(event))) => {
+                    self.subscription = Some(subscription);
+                    drained += 1;
+                    if let Err(error) = self.store.record_event(thread_id, &event) {
+                        self.logger.warn(
+                            "event_store_failed",
+                            &[("cycle_id", cycle_id), ("error", &format!("{error:#}"))],
+                        );
+                    }
+                }
+                Ok(Ok(None)) | Ok(Err(_)) => {
+                    // Closed or broken: the next ensure_subscription rebuilds it.
+                    self.subscription = None;
+                    break;
+                }
+            }
+        }
+        drained
     }
 
     /// Reads events until the turn the send started has finished.

@@ -77,6 +77,7 @@
 | `turn_stopped` が来ない場合の完了判定 | `store::is_finished_state` + `status_changed: idle` | `tests/daemon_cycle.rs::events_arriving_after_the_turn_are_still_stored` |
 | 応答が来ないまま時間切れでも送信は成立させる | `TurnOutcome::TimedOut` | `a_silent_agent_does_not_block_the_next_cycle` |
 | 短いターン（`generating` を観測できない）でも完了する | `Daemon::await_turn`（エージェント本文 + `idle` で完了） | `a_turn_without_a_generating_event_still_finishes` |
+| サイクル間のイベントをターン本文と混同しない | `Daemon::drain_pending_events`（送信前に読み切る） | `events_from_before_the_send_are_not_taken_as_the_answer` |
 
 ## §9 参照実装（CLI）
 

@@ -175,8 +175,9 @@ pub trait FindingSource {
 
 - `awaiting_approval` は迂回しません（仕様どおり）。承認は Zed の UI が持ちます。
 - `notify` モードは未実装なので使いません（常に `prompt`）。
-- サイクル間はイベントを読みません。購読接続は保持しますが、ターン外のイベントは
-  次に読むまでソケットバッファに溜まります（`storage` のイベント列はターン中のみ）。
+- 購読接続はサイクルをまたいで保持しますが、イベントを読むのは送信前（溜まっていた分）と
+  ターン中だけです。完全に独立した常駐読み取りタスクは持たないため、サイクル間の取得は
+  「次のサイクルの頭でまとめて」になります（ソケットバッファを超える量は失われ得ます）。
 - `command` ソースはサイクルごとに同期実行です（1 回/サイクルなので許容）。
 - ソケットパスは Unix socket の長さ制限（`SUN_LEN`）を受けるため、深いディレクトリに置けません。
 - `ledger.jsonl` は追記のみで、自動では削除しません（ローテートは人手）。
@@ -200,7 +201,7 @@ pub trait FindingSource {
 ## 11. テスト
 
 ```sh
-cargo test          # 94 tests: lib 57 / daemon_cycle 21 / protocol_conformance 16
+cargo test          # 95 tests: lib 57 / daemon_cycle 22 / protocol_conformance 16
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 ```
