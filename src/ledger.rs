@@ -63,7 +63,8 @@ pub struct LedgerRecord {
     pub message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
-    /// The message body, so an operator can see what was actually sent.
+    /// The message body, so an operator can see what was actually sent. Only the
+    /// `begin` line of an attempt carries it; state changes leave it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default)]
@@ -76,6 +77,10 @@ pub struct Ledger {
     path: PathBuf,
     records: BTreeMap<String, LedgerRecord>,
     skipped_lines: usize,
+    /// A crash can leave the file without a final newline. The next record has to
+    /// start on a line of its own, or it would merge into the torn one and be
+    /// lost on the next start - exactly the record write-ahead exists to keep.
+    needs_newline: bool,
 }
 
 impl Ledger {
@@ -87,8 +92,10 @@ impl Ledger {
 
         let mut records = BTreeMap::new();
         let mut skipped_lines = 0;
+        let mut needs_newline = false;
         match std::fs::read_to_string(&path) {
             Ok(text) => {
+                needs_newline = !text.is_empty() && !text.ends_with('\n');
                 for line in text.lines() {
                     if line.trim().is_empty() {
                         continue;
@@ -112,6 +119,7 @@ impl Ledger {
             path,
             records,
             skipped_lines,
+            needs_newline,
         })
     }
 
@@ -243,6 +251,17 @@ impl Ledger {
         cycle_id: &str,
         message: &str,
     ) -> Result<()> {
+        if let Some(existing) = self.records.get(request_id)
+            && (existing.thread_id != thread_id
+                || existing.content_hash != content_hash
+                || existing.attempt != attempt)
+        {
+            // The id is derived from (thread, content, attempt); a different
+            // record under the same id means the derivation collided, and
+            // overwriting would silently drop a blocking record.
+            anyhow::bail!("request id {request_id} is already used by another message");
+        }
+
         let record = LedgerRecord {
             request_id: request_id.to_string(),
             thread_id: thread_id.to_string(),
@@ -277,6 +296,9 @@ impl Ledger {
             message_id,
             error_code,
             recorded_at: now_rfc3339(),
+            // The body is already on the `begin` line; repeating it on every
+            // state change would double the ledger for no extra information.
+            message: None,
             ..existing
         };
         self.persist(&record)?;
@@ -284,13 +306,18 @@ impl Ledger {
         Ok(())
     }
 
-    fn persist(&self, record: &LedgerRecord) -> Result<()> {
+    fn persist(&mut self, record: &LedgerRecord) -> Result<()> {
         let line = serde_json::to_string(record).context("encoding a ledger record")?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
             .with_context(|| format!("opening ledger {}", self.path.display()))?;
+        if self.needs_newline {
+            // Start on a fresh line so this record is not glued to a torn one.
+            file.write_all(b"\n")
+                .with_context(|| format!("repairing {}", self.path.display()))?;
+        }
         writeln!(file, "{line}").with_context(|| format!("writing {}", self.path.display()))?;
         file.flush()
             .with_context(|| format!("flushing {}", self.path.display()))?;
@@ -298,6 +325,7 @@ impl Ledger {
         // to reach the disk before the request does.
         file.sync_data()
             .with_context(|| format!("syncing {}", self.path.display()))?;
+        self.needs_newline = false;
         Ok(())
     }
 }
@@ -359,7 +387,11 @@ mod tests {
         let record = reloaded.get(&request_id).expect("record present");
         assert_eq!(record.state, LedgerState::Delivered);
         assert_eq!(record.message_id.as_deref(), Some("12"));
-        assert_eq!(record.message.as_deref(), Some("message"));
+        assert_eq!(record.message_bytes, "message".len());
+        // The body is on the write-ahead line, which is what an operator reads.
+        let contents =
+            std::fs::read_to_string(directory.path().join(LEDGER_FILE)).expect("read ledger");
+        assert!(contents.contains("\"message\":\"message\""));
         assert!(reloaded.find_blocking("thread-a", &hash).is_some());
     }
 
@@ -428,6 +460,42 @@ mod tests {
         let ledger = Ledger::open(directory.path()).expect("open");
         assert_eq!(ledger.skipped_lines(), 1);
         assert_eq!(ledger.len(), 1);
+    }
+
+    #[test]
+    fn a_torn_tail_does_not_swallow_the_next_record() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        std::fs::write(directory.path().join(LEDGER_FILE), "{\"request_id\":\"torn")
+            .expect("write a torn tail");
+
+        let mut ledger = Ledger::open(directory.path()).expect("open");
+        assert_eq!(ledger.skipped_lines(), 1);
+        let hash = Ledger::content_hash("message");
+        let request_id = Ledger::request_id("thread-a", &hash, 0);
+        ledger
+            .begin(&request_id, "thread-a", &hash, 0, "cycle-1", "message")
+            .expect("begin");
+        drop(ledger);
+
+        let reloaded = Ledger::open(directory.path()).expect("reopen");
+        let record = reloaded.get(&request_id).expect("record survived");
+        assert_eq!(record.state, LedgerState::Sending);
+    }
+
+    #[test]
+    fn reusing_an_id_for_other_content_is_refused() {
+        let (_directory, mut ledger) = ledger();
+        let hash = Ledger::content_hash("message");
+        let request_id = Ledger::request_id("thread-a", &hash, 0);
+        ledger
+            .begin(&request_id, "thread-a", &hash, 0, "cycle-1", "message")
+            .expect("begin");
+
+        let error = ledger
+            .begin(&request_id, "thread-b", &hash, 0, "cycle-2", "message")
+            .expect_err("must refuse a colliding id");
+
+        assert!(format!("{error:#}").contains("already used"));
     }
 
     #[test]

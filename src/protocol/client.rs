@@ -8,9 +8,9 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::timeout;
 
-use super::MAX_LINE_BYTES;
 use super::error::{ClientError, ClientStage};
-use super::types::{Request, Response, Status, ThreadEvent};
+use super::types::{EventKind, Request, Response, Status, ThreadEvent};
+use super::{MAX_EVENT_LINE_BYTES, MAX_LINE_BYTES};
 
 /// Everything needed to reach one bridge socket.
 #[derive(Debug, Clone)]
@@ -56,6 +56,37 @@ impl<R: AsyncRead + Unpin> LineReader<R> {
             reader: BufReader::new(reader),
             buffer: Vec::new(),
             limit,
+        }
+    }
+
+    /// Discards the rest of the current line.
+    ///
+    /// Used when a line is too long to keep: the subscription stays usable, and
+    /// only that line is lost.
+    pub async fn skip_line(&mut self) -> Result<(), ClientError> {
+        self.buffer.clear();
+        loop {
+            let (consumed, complete) = {
+                let available = self
+                    .reader
+                    .fill_buf()
+                    .await
+                    .map_err(|source| ClientError::Io {
+                        stage: ClientStage::Read,
+                        source,
+                    })?;
+                if available.is_empty() {
+                    return Ok(());
+                }
+                match available.iter().position(|byte| *byte == b'\n') {
+                    Some(index) => (index + 1, true),
+                    None => (available.len(), false),
+                }
+            };
+            self.reader.consume(consumed);
+            if complete {
+                return Ok(());
+            }
         }
     }
 
@@ -116,6 +147,9 @@ impl<R: AsyncRead + Unpin> LineReader<R> {
     }
 }
 
+/// Event kind used for a line the subscriber had to discard.
+pub const LINE_TOO_LARGE_EVENT: &str = "line_too_large";
+
 fn decode_line(bytes: Vec<u8>) -> Result<String, ClientError> {
     match String::from_utf8(bytes) {
         Ok(line) => Ok(line.trim_end_matches('\r').to_string()),
@@ -144,6 +178,14 @@ impl Connection {
         socket_path: &std::path::Path,
         connect_timeout: Duration,
     ) -> Result<Self, ClientError> {
+        Self::connect_with_limit(socket_path, connect_timeout, MAX_LINE_BYTES).await
+    }
+
+    async fn connect_with_limit(
+        socket_path: &std::path::Path,
+        connect_timeout: Duration,
+        line_limit: usize,
+    ) -> Result<Self, ClientError> {
         let stream = match timeout(connect_timeout, UnixStream::connect(socket_path)).await {
             Err(_) => {
                 return Err(ClientError::Timeout {
@@ -161,7 +203,7 @@ impl Connection {
         };
         let (read, write) = stream.into_split();
         Ok(Self {
-            lines: LineReader::new(read, MAX_LINE_BYTES),
+            lines: LineReader::new(read, line_limit),
             writer: write,
             served: 0,
         })
@@ -332,8 +374,14 @@ impl BridgeClient {
     ) -> Result<Subscription, ClientError> {
         let request = Request::watch_thread(request_id, thread_id);
         let line = request.to_line()?;
-        let mut connection =
-            Connection::connect(&self.config.socket_path, self.config.connect_timeout).await?;
+        // Event lines carry whole messages, so this connection reads with the
+        // larger ceiling from the start.
+        let mut connection = Connection::connect_with_limit(
+            &self.config.socket_path,
+            self.config.connect_timeout,
+            MAX_EVENT_LINE_BYTES,
+        )
+        .await?;
 
         let write = timeout(self.config.request_timeout, async {
             connection.writer.write_all(line.as_bytes()).await?;
@@ -390,6 +438,7 @@ impl BridgeClient {
             request_id: request_id.to_string(),
             thread_id: thread_id.to_string(),
             initial: response,
+            skipped_lines: 0,
         })
     }
 }
@@ -401,6 +450,7 @@ pub struct Subscription {
     request_id: String,
     thread_id: String,
     initial: Response,
+    skipped_lines: usize,
 }
 
 impl std::fmt::Debug for Subscription {
@@ -434,17 +484,47 @@ impl Subscription {
     /// Reads the next event.
     ///
     /// `Ok(None)` means the bridge closed the connection, so the watch is gone
-    /// and the daemon has to reconnect. Lines that are not events are skipped.
+    /// and the daemon has to reconnect. Other lines are skipped: a rejection is
+    /// returned as an error so the caller learns why, and an oversized line is
+    /// discarded with a synthetic `line_too_large` event so the loss is visible
+    /// instead of killing the subscription.
     pub async fn next_event(&mut self) -> Result<Option<ThreadEvent>, ClientError> {
         loop {
-            let Some(line) = self.lines.next_line().await? else {
-                return Ok(None);
+            let line = match self.lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => return Ok(None),
+                Err(ClientError::LineTooLarge { bytes, limit }) => {
+                    self.lines.skip_line().await?;
+                    self.skipped_lines += 1;
+                    return Ok(Some(ThreadEvent {
+                        watch_id: self.request_id.clone(),
+                        thread_id: self.thread_id.clone(),
+                        kind: EventKind::from_wire(LINE_TOO_LARGE_EVENT),
+                        entry: None,
+                        state: None,
+                        detail: Some(format!(
+                            "discarded a {bytes} byte event line (limit {limit})"
+                        )),
+                    }));
+                }
+                Err(error) => return Err(error),
             };
             let response = decode_response(&line)?;
             if let Some(event) = response.event {
                 return Ok(Some(event));
             }
+            if response.is_rejection() {
+                return Err(ClientError::WatchRejected {
+                    status: response.status,
+                    error: response.error,
+                });
+            }
         }
+    }
+
+    /// How many event lines were discarded for being too long.
+    pub fn skipped_lines(&self) -> usize {
+        self.skipped_lines
     }
 }
 

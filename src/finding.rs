@@ -268,7 +268,9 @@ pub fn render_batches(findings: &[Finding], max_bytes: usize) -> Vec<String> {
     // The bridge limits the encoded line, not the text, and every newline or
     // quote in a message takes two bytes once escaped. Sizing on the encoded form
     // is what keeps a message under the limit.
-    let header_room = wire_len(&render_message(&[], 1, 99));
+    // The part marker grows with the number of batches; `999` is far more than
+    // one cycle ever produces and keeps the arithmetic honest.
+    let header_room = wire_len(&render_message(&[], 1, 999));
     let budget = max_bytes.saturating_sub(header_room).max(1);
 
     let mut batches: Vec<Vec<String>> = Vec::new();

@@ -26,8 +26,8 @@ use crate::finding::{
 use crate::ledger::{Ledger, LedgerState};
 use crate::logging::Logger;
 use crate::protocol::{
-    BridgeClient, ErrorCode, EventKind, RecommendedAction, Status, Subscription, ThreadEvent,
-    ThreadState, ThreadStatusInfo,
+    BridgeClient, ErrorCode, EventKind, LINE_TOO_LARGE_EVENT, RecommendedAction, Status,
+    Subscription, ThreadEvent, ThreadState, ThreadStatusInfo,
 };
 use crate::store::{Store, TurnCapture, is_finished_state};
 use crate::time::unix_millis;
@@ -67,8 +67,10 @@ pub enum CycleOutcome {
     },
     /// Transient trouble; the next cycle tries again.
     Deferred(String),
-    /// The operator has to fix something.
+    /// The operator has to fix something, but the cycle can be retried.
     Failed(String),
+    /// A bug on either side; the daemon stops instead of looping.
+    Stopped(String),
 }
 
 impl CycleOutcome {
@@ -87,6 +89,7 @@ impl CycleOutcome {
             ),
             Self::Deferred(reason) => format!("deferred: {reason}"),
             Self::Failed(reason) => format!("failed: {reason}"),
+            Self::Stopped(reason) => format!("stopped: {reason}"),
         }
     }
 }
@@ -103,6 +106,9 @@ enum SendOutcome {
     Deferred(String),
     /// Give up on this cycle.
     Failed(String),
+    /// Stop the daemon: the bridge answered something a correct client cannot
+    /// provoke without a bug on one side.
+    Fatal(String),
 }
 
 /// What happened while waiting for the agent's answer.
@@ -113,6 +119,47 @@ enum TurnOutcome {
     TimedOut,
     /// The watch kept failing.
     Lost(String),
+}
+
+/// Keeps one daemon per storage directory.
+///
+/// Two daemons on the same storage would send the same message with the same
+/// `request_id`; while Zed still remembers the id that looks like
+/// `duplicate_request`, but after Zed restarts it is a real second delivery.
+#[derive(Debug)]
+pub struct InstanceLock {
+    _file: std::fs::File,
+    path: std::path::PathBuf,
+}
+
+impl InstanceLock {
+    /// Takes the lock in `directory`, or fails when another process holds it.
+    pub fn acquire(directory: &std::path::Path) -> Result<Self> {
+        std::fs::create_dir_all(directory)
+            .with_context(|| format!("creating storage directory {}", directory.display()))?;
+        let path = directory.join("daemon.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file, path }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::bail!("another zed-audit-loop already holds {}", path.display());
+            }
+            Err(std::fs::TryLockError::Error(error)) => Err(error)
+                .with_context(|| format!("locking {} (is the filesystem local?)", path.display())),
+        }
+    }
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// The audit daemon.
@@ -272,8 +319,15 @@ impl Daemon {
     }
 
     /// Runs the loop until a termination signal arrives.
+    ///
+    /// The signal only raises a flag, so a cycle in progress finishes: aborting
+    /// one in the middle of a send would leave a `sending` record whose fate is
+    /// unknown, and the daemon never resends those.
     pub async fn run(&mut self) -> Result<()> {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         use tokio::signal::unix::{SignalKind, signal};
+        use tokio::sync::Notify;
 
         let mut interrupt = signal(SignalKind::interrupt()).context("listening for SIGINT")?;
         let mut terminate = signal(SignalKind::terminate()).context("listening for SIGTERM")?;
@@ -295,20 +349,36 @@ impl Daemon {
                 .error("reconcile_error", &[("error", &format!("{error:#}"))]);
         }
 
-        loop {
-            // `run_once` logs its own outcome, so the loop only needs to know
-            // whether it was interrupted.
+        let stopping = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(Notify::new());
+        let stopping_task = Arc::clone(&stopping);
+        let wake_task = Arc::clone(&wake);
+        tokio::spawn(async move {
             tokio::select! {
-                _ = interrupt.recv() => break,
-                _ = terminate.recv() => break,
-                _ = self.run_once() => {}
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+            stopping_task.store(true, Ordering::SeqCst);
+            wake_task.notify_waiters();
+        });
+
+        loop {
+            if stopping.load(Ordering::SeqCst) {
+                break;
+            }
+            // `run_once` logs its own outcome; only a fatal one leaves the loop.
+            if let CycleOutcome::Stopped(reason) = self.run_once().await {
+                self.logger.error("daemon_stopping", &[("reason", &reason)]);
+                break;
+            }
+            if stopping.load(Ordering::SeqCst) {
+                break;
             }
 
             let interval = Duration::from_secs(self.config.cycle.interval_secs);
             tokio::select! {
-                _ = interrupt.recv() => break,
-                _ = terminate.recv() => break,
                 () = sleep(interval) => {}
+                () = wake.notified() => {}
             }
         }
 
@@ -337,15 +407,37 @@ impl Daemon {
             Err(reason) => return CycleOutcome::Deferred(reason),
         };
 
-        if let Err(error) = self.ensure_subscription(&thread_id, cycle_id).await {
-            return CycleOutcome::Deferred(format!("watch failed: {error}"));
-        }
-
         let status = match self.thread_status(&thread_id).await {
             Ok(status) => status,
             Err(reason) => return CycleOutcome::Deferred(reason),
         };
         self.log_thread_state(cycle_id, &thread_id, &status);
+
+        if status.archived {
+            return CycleOutcome::Deferred("thread is archived".to_string());
+        }
+        if status.state == ThreadState::AwaitingApproval {
+            self.logger.warn(
+                "approval_pending",
+                &[("cycle_id", cycle_id), ("thread_id", &thread_id)],
+            );
+            return CycleOutcome::Deferred("thread is waiting for user approval".to_string());
+        }
+        // Sending while the agent is mid-turn would queue the message behind a
+        // turn this daemon does not control, and that turn's answer would be
+        // recorded as the answer to this one. Wait for idle instead.
+        if matches!(
+            status.state,
+            ThreadState::Generating | ThreadState::Unconfirmed
+        ) {
+            return CycleOutcome::Deferred(format!("agent is busy ({})", status.state));
+        }
+
+        // The watch is opened only for a thread that can actually take a message,
+        // so an archived thread never holds one of the bridge's eight slots.
+        if let Err(error) = self.ensure_subscription(&thread_id, cycle_id).await {
+            return CycleOutcome::Deferred(format!("watch failed: {error}"));
+        }
 
         // Anything the watch buffered since the last cycle belongs to an earlier
         // turn: it is stored, but must not be mistaken for the answer to the
@@ -360,17 +452,6 @@ impl Daemon {
                     ("count", &drained.to_string()),
                 ],
             );
-        }
-
-        if status.archived {
-            return CycleOutcome::Deferred("thread is archived".to_string());
-        }
-        if status.state == ThreadState::AwaitingApproval {
-            self.logger.warn(
-                "approval_pending",
-                &[("cycle_id", cycle_id), ("thread_id", &thread_id)],
-            );
-            return CycleOutcome::Deferred("thread is waiting for user approval".to_string());
         }
 
         let batch = match self.source.read_batch() {
@@ -449,7 +530,10 @@ impl Daemon {
                         ],
                     );
 
-                    match self.await_turn(cycle_id, thread_id, &request_id).await {
+                    match self
+                        .await_turn(cycle_id, thread_id, &request_id, was_queued)
+                        .await
+                    {
                         TurnOutcome::Completed {
                             entries: captured,
                             text_bytes: text,
@@ -477,6 +561,7 @@ impl Daemon {
                 SendOutcome::Blocked(reason) => return CycleOutcome::Deferred(reason),
                 SendOutcome::Deferred(reason) => return CycleOutcome::Deferred(reason),
                 SendOutcome::Failed(reason) => return CycleOutcome::Failed(reason),
+                SendOutcome::Fatal(reason) => return CycleOutcome::Stopped(reason),
             }
         }
 
@@ -631,8 +716,15 @@ impl Daemon {
                                 );
                             }
                             RecommendedAction::Resend => {}
-                            RecommendedAction::Stop
-                            | RecommendedAction::Split
+                            // A specification mismatch or a bug: looping would
+                            // just repeat it every interval, so the daemon stops.
+                            RecommendedAction::Stop => {
+                                return SendOutcome::Fatal(format!(
+                                    "bridge refused the request with {code}; \
+                                     the request or the client is wrong"
+                                ));
+                            }
+                            RecommendedAction::Split
                             | RecommendedAction::UsePrompt
                             | RecommendedAction::FixSettings => {
                                 return SendOutcome::Failed(format!(
@@ -642,9 +734,20 @@ impl Daemon {
                         }
                     }
                     Status::Accepted | Status::Event | Status::Other(_) => {
-                        self.finish_rejected(&request_id, LOCAL_ERROR_UNEXPECTED_STATUS);
+                        // A status this client does not know may well mean the
+                        // message was accepted, so it is never resent.
+                        if let Err(error) = self.ledger.finish(
+                            &request_id,
+                            LedgerState::Unknown,
+                            None,
+                            Some(LOCAL_ERROR_UNEXPECTED_STATUS.to_string()),
+                        ) {
+                            return SendOutcome::Failed(format!(
+                                "writing the ledger failed: {error:#}"
+                            ));
+                        }
                         return SendOutcome::Deferred(format!(
-                            "unexpected send status {}",
+                            "unknown send status {}; not resending",
                             response.status
                         ));
                     }
@@ -775,11 +878,17 @@ impl Daemon {
         cycle_id: &str,
         thread_id: &str,
         request_id: &str,
+        queued: bool,
     ) -> TurnOutcome {
         let deadline = Instant::now() + Duration::from_secs(self.config.cycle.await_response_secs);
         let mut capture = TurnCapture::default();
         let mut seen_generating = false;
+        let mut saw_entry = false;
         let mut lost = 0u32;
+        // A queued message waits behind a turn this daemon did not start, so its
+        // events only count once that turn has ended. Anything before that
+        // boundary belongs to the earlier turn.
+        let mut boundary_passed = !queued;
 
         loop {
             if self.subscription.is_none() {
@@ -792,8 +901,14 @@ impl Daemon {
                     if status.state == ThreadState::Generating {
                         seen_generating = true;
                     }
-                    if is_finished_state(&status.state)
-                        && (seen_generating || capture.saw_agent_text())
+                    if !boundary_passed && is_finished_state(&status.state) {
+                        // The turn our message was queued behind has ended.
+                        boundary_passed = true;
+                        seen_generating = false;
+                        saw_entry = false;
+                    } else if boundary_passed
+                        && is_finished_state(&status.state)
+                        && alive(seen_generating, saw_entry, &capture)
                     {
                         return self.complete_turn(thread_id, request_id, capture, None);
                     }
@@ -881,7 +996,10 @@ impl Daemon {
                     match &event.kind {
                         EventKind::EntryAdded | EventKind::EntryUpdated => {
                             if let Some(entry) = &event.entry {
-                                capture.observe(entry);
+                                saw_entry = true;
+                                if boundary_passed {
+                                    capture.observe(entry);
+                                }
                             }
                         }
                         EventKind::EntryRemoved => {
@@ -902,8 +1020,14 @@ impl Daemon {
                                         &[("cycle_id", cycle_id), ("thread_id", thread_id)],
                                     );
                                 }
-                                if turn_finishes(&event, seen_generating, capture.saw_agent_text())
-                                {
+                                if !boundary_passed && is_finished_state(state) {
+                                    boundary_passed = true;
+                                    seen_generating = false;
+                                    saw_entry = false;
+                                } else if turn_finishes(
+                                    &event,
+                                    alive(seen_generating, saw_entry, &capture),
+                                ) {
                                     let subscription = self.subscription.take();
                                     let outcome = self.complete_turn(
                                         thread_id,
@@ -917,7 +1041,18 @@ impl Daemon {
                             }
                         }
                         EventKind::TurnStopped => {
-                            if turn_finishes(&event, seen_generating, capture.saw_agent_text()) {
+                            if !boundary_passed {
+                                boundary_passed = true;
+                                seen_generating = false;
+                                saw_entry = false;
+                                self.logger.debug(
+                                    "queued_boundary",
+                                    &[("cycle_id", cycle_id), ("thread_id", thread_id)],
+                                );
+                            } else if turn_finishes(
+                                &event,
+                                alive(seen_generating, saw_entry, &capture),
+                            ) {
                                 let subscription = self.subscription.take();
                                 let outcome = self.complete_turn(
                                     thread_id,
@@ -950,6 +1085,19 @@ impl Daemon {
                             );
                         }
                         EventKind::TitleUpdated => {}
+                        EventKind::Other(kind) if kind == LINE_TOO_LARGE_EVENT => {
+                            // The bridge does not bound the lines it writes; one
+                            // that outgrew the read ceiling was dropped so the
+                            // subscription survives.
+                            self.logger.warn(
+                                "event_too_large",
+                                &[
+                                    ("cycle_id", cycle_id),
+                                    ("thread_id", thread_id),
+                                    ("detail", event.detail.as_deref().unwrap_or("")),
+                                ],
+                            );
+                        }
                         EventKind::Other(kind) => {
                             self.logger
                                 .debug("event_ignored", &[("cycle_id", cycle_id), ("kind", kind)]);
@@ -1088,7 +1236,9 @@ impl Daemon {
             CycleOutcome::Idle(_) => self.logger.info("cycle_finished", fields),
             CycleOutcome::Sent { .. } => self.logger.info("cycle_finished", fields),
             CycleOutcome::Deferred(_) => self.logger.info("cycle_finished", fields),
-            CycleOutcome::Failed(_) => self.logger.error("cycle_finished", fields),
+            CycleOutcome::Failed(_) | CycleOutcome::Stopped(_) => {
+                self.logger.error("cycle_finished", fields);
+            }
         }
     }
 }
@@ -1123,14 +1273,21 @@ fn build_source(
     }
 }
 
+/// Whether the turn has shown any sign of life.
+///
+/// `generating`, any entry (tool calls included), or agent text all count. A
+/// turn that produced none of them cannot be told apart from a leftover event.
+fn alive(seen_generating: bool, saw_entry: bool, capture: &TurnCapture) -> bool {
+    seen_generating || saw_entry || capture.saw_agent_text()
+}
+
 /// Whether an event ends the turn the daemon is waiting for.
 ///
 /// An event only counts once the turn has shown a sign of life: `generating`, or
 /// agent text. Without that guard, an event left over from an earlier turn (the
 /// stream is not replayed but it is also not filtered) could end the wrong turn
 /// and record an empty answer against the new `request_id`.
-fn turn_finishes(event: &ThreadEvent, seen_generating: bool, has_agent_text: bool) -> bool {
-    let alive = seen_generating || has_agent_text;
+fn turn_finishes(event: &ThreadEvent, alive: bool) -> bool {
     match &event.kind {
         EventKind::TurnStopped => alive,
         EventKind::StatusChanged => alive && event.state.as_ref().is_some_and(is_finished_state),
@@ -1161,35 +1318,31 @@ mod tests {
     #[test]
     fn a_stale_stop_does_not_end_a_turn_that_never_started() {
         let stopped = event(EventKind::TurnStopped, None);
-        assert!(!turn_finishes(&stopped, false, false));
+        assert!(!turn_finishes(&stopped, false));
 
         let idle = event(EventKind::StatusChanged, Some("idle"));
-        assert!(!turn_finishes(&idle, false, false));
+        assert!(!turn_finishes(&idle, false));
     }
 
     #[test]
     fn a_stop_ends_a_turn_that_showed_life() {
         let stopped = event(EventKind::TurnStopped, None);
-        assert!(turn_finishes(&stopped, true, false));
-        assert!(turn_finishes(&stopped, false, true));
+        assert!(turn_finishes(&stopped, true));
     }
 
     #[test]
     fn only_idle_ends_a_turn_through_a_state_change() {
         assert!(turn_finishes(
             &event(EventKind::StatusChanged, Some("idle")),
-            true,
-            false
+            true
         ));
         assert!(!turn_finishes(
             &event(EventKind::StatusChanged, Some("generating")),
-            true,
-            false
+            true
         ));
         assert!(!turn_finishes(
             &event(EventKind::StatusChanged, Some("awaiting_approval")),
-            true,
-            false
+            true
         ));
     }
 
@@ -1202,11 +1355,21 @@ mod tests {
             EventKind::TitleUpdated,
             EventKind::ToolAuthorizationRequested,
         ] {
-            assert!(
-                !turn_finishes(&event(kind.clone(), None), true, true),
-                "{kind}"
-            );
+            assert!(!turn_finishes(&event(kind.clone(), None), true), "{kind}");
         }
+    }
+
+    #[test]
+    fn one_daemon_per_storage_directory() {
+        let directory = tempfile::tempdir().expect("temp dir");
+
+        let first = InstanceLock::acquire(directory.path()).expect("first lock");
+        let error = InstanceLock::acquire(directory.path()).expect_err("second daemon must fail");
+        assert!(format!("{error:#}").contains("already holds"));
+
+        // Releasing the first makes room again.
+        drop(first);
+        InstanceLock::acquire(directory.path()).expect("lock after release");
     }
 
     #[test]

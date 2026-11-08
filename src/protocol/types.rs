@@ -576,6 +576,116 @@ mod tests {
     }
 
     #[test]
+    fn every_documented_error_code_round_trips() {
+        let codes = [
+            "invalid_json",
+            "unsupported_version",
+            "unknown_action",
+            "invalid_request",
+            "message_too_large",
+            "unknown_request",
+            "duplicate_request",
+            "queue_full",
+            "thread_archived",
+            "thread_unavailable",
+            "awaiting_approval",
+            "notify_disabled",
+            "prompt_disabled",
+            "bridge_disabled",
+            "internal",
+        ];
+        for code in codes {
+            let parsed = ErrorCode::from_wire(code);
+            assert!(parsed.is_known(), "{code} must be understood");
+            assert_eq!(parsed.as_wire(), code);
+        }
+    }
+
+    #[test]
+    fn every_error_code_has_a_recommended_action() {
+        let expected = [
+            (ErrorCode::InvalidJson, RecommendedAction::Stop),
+            (ErrorCode::UnsupportedVersion, RecommendedAction::Stop),
+            (ErrorCode::UnknownAction, RecommendedAction::Stop),
+            (ErrorCode::InvalidRequest, RecommendedAction::Stop),
+            (ErrorCode::Internal, RecommendedAction::Stop),
+            (ErrorCode::MessageTooLarge, RecommendedAction::Split),
+            (ErrorCode::UnknownRequest, RecommendedAction::Resend),
+            (ErrorCode::DuplicateRequest, RecommendedAction::AlreadySent),
+            (ErrorCode::QueueFull, RecommendedAction::BackOff),
+            (ErrorCode::ThreadArchived, RecommendedAction::Reselect),
+            (ErrorCode::ThreadUnavailable, RecommendedAction::OpenProject),
+            (
+                ErrorCode::AwaitingApproval,
+                RecommendedAction::WaitForApproval,
+            ),
+            (ErrorCode::NotifyDisabled, RecommendedAction::UsePrompt),
+            (ErrorCode::PromptDisabled, RecommendedAction::FixSettings),
+            (ErrorCode::BridgeDisabled, RecommendedAction::FixSettings),
+        ];
+        for (code, action) in expected {
+            assert_eq!(code.recommended_action(), action, "{code}");
+        }
+    }
+
+    #[test]
+    fn every_documented_status_and_state_round_trips() {
+        for status in [
+            "accepted",
+            "queued",
+            "delivered",
+            "event",
+            "thread_not_found",
+            "thread_unavailable",
+            "unsupported_thread_type",
+            "rejected",
+            "error",
+        ] {
+            assert_eq!(Status::from_wire(status).as_wire(), status);
+            assert!(Status::from_wire(status).is_known(), "{status}");
+        }
+        for state in [
+            "draft",
+            "idle",
+            "generating",
+            "awaiting_approval",
+            "unconfirmed",
+            "unknown",
+        ] {
+            assert_eq!(ThreadState::from_wire(state).as_wire(), state);
+        }
+        for kind in [
+            "entry_added",
+            "entry_updated",
+            "entry_removed",
+            "status_changed",
+            "title_updated",
+            "tool_authorization_requested",
+            "tool_authorization_received",
+            "turn_stopped",
+        ] {
+            assert_eq!(EventKind::from_wire(kind).as_wire(), kind);
+            assert!(EventKind::from_wire(kind).is_known(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_session_target_uses_session_id_and_not_thread_id() {
+        let request = Request {
+            request_id: "status-1".to_string(),
+            action: Action::GetThreadStatus,
+            target: Some(ThreadTarget::SessionId("session-a".to_string())),
+            message: None,
+        };
+
+        let line = request.to_line().expect("encodes");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+
+        assert_eq!(value["session_id"], "session-a");
+        assert!(value.get("thread_id").is_none());
+    }
+
+    #[test]
     fn recorded_rejections_are_the_ones_needing_a_fresh_request_id() {
         for code in [
             ErrorCode::QueueFull,

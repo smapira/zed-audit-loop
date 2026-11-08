@@ -105,7 +105,7 @@ impl ClientError {
         matches!(
             self.stage(),
             Some(ClientStage::Connect | ClientStage::Write)
-        )
+        ) || matches!(self, Self::RequestTooLarge { .. } | Self::Encode(_))
     }
 }
 
@@ -162,6 +162,66 @@ impl std::error::Error for ClientError {
         match self {
             Self::NotConnected { source, .. } | Self::Io { source, .. } => Some(source),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_request_that_never_fit_is_never_treated_as_delivered() {
+        let error = ClientError::RequestTooLarge {
+            bytes: 70_000,
+            limit: 65_536,
+        };
+
+        assert!(error.never_reached_bridge());
+        assert!(!error.is_retryable());
+        assert!(error.to_string().contains("split the message"));
+    }
+
+    #[test]
+    fn a_read_side_failure_may_have_reached_the_bridge() {
+        for error in [
+            ClientError::Timeout {
+                stage: ClientStage::Read,
+                after: Duration::from_secs(1),
+            },
+            ClientError::UnexpectedEof {
+                stage: ClientStage::Read,
+            },
+            ClientError::LineTooLarge {
+                bytes: 70_000,
+                limit: 65_536,
+            },
+            ClientError::MalformedResponse {
+                line: "{".to_string(),
+                detail: "unexpected end of input".to_string(),
+            },
+        ] {
+            assert!(!error.never_reached_bridge(), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_connect_or_write_failure_never_reached_the_bridge() {
+        for error in [
+            ClientError::Timeout {
+                stage: ClientStage::Connect,
+                after: Duration::from_secs(1),
+            },
+            ClientError::Io {
+                stage: ClientStage::Write,
+                source: std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+            },
+            ClientError::NotConnected {
+                path: std::path::PathBuf::from("/tmp/missing.sock"),
+                source: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+        ] {
+            assert!(error.never_reached_bridge(), "{error}");
         }
     }
 }

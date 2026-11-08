@@ -7,7 +7,7 @@ use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
 
 use zed_audit_loop::config::Config;
-use zed_audit_loop::daemon::Daemon;
+use zed_audit_loop::daemon::{Daemon, InstanceLock};
 use zed_audit_loop::logging::{Level, Logger};
 use zed_audit_loop::protocol::{BridgeClient, Status};
 use zed_audit_loop::time::unix_millis;
@@ -58,7 +58,7 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let home = home_dir()?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -75,6 +75,10 @@ fn run() -> Result<()> {
             apply_overrides(&mut config, &cli);
             config.validate()?;
 
+            let home = home.context(
+                "HOME is not set; the daemon needs it for its storage directory \
+                 (set [storage] dir explicitly is not enough to expand `~`)",
+            )?;
             let logger = build_logger(&config, &home)?;
             logger.info(
                 "config_loaded",
@@ -85,19 +89,21 @@ fn run() -> Result<()> {
                 ],
             );
 
-            runtime.block_on(async {
+            let storage_dir = config.storage_dir(&home);
+            runtime.block_on(async move {
+                let _lock = InstanceLock::acquire(&storage_dir)?;
                 let mut daemon = Daemon::new(config, logger, home)?;
                 daemon.run().await
             })
         }
-        Command::ListThreads => runtime.block_on(list_threads(&cli, &home)),
+        Command::ListThreads => runtime.block_on(list_threads(&cli, home.as_deref())),
         Command::ThreadStatus { thread_id } => {
-            runtime.block_on(thread_status(&cli, &home, thread_id))
+            runtime.block_on(thread_status(&cli, home.as_deref(), thread_id))
         }
     }
 }
 
-async fn list_threads(cli: &Cli, home: &std::path::Path) -> Result<()> {
+async fn list_threads(cli: &Cli, home: Option<&std::path::Path>) -> Result<()> {
     let mut client = build_client(cli, home)?;
     let request_id = format!("cli-list-{}", unix_millis(std::time::SystemTime::now()));
     let response = client.list_threads(&request_id).await?;
@@ -114,7 +120,7 @@ async fn list_threads(cli: &Cli, home: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-async fn thread_status(cli: &Cli, home: &std::path::Path, thread_id: &str) -> Result<()> {
+async fn thread_status(cli: &Cli, home: Option<&std::path::Path>, thread_id: &str) -> Result<()> {
     let mut client = build_client(cli, home)?;
     let request_id = format!("cli-status-{}", unix_millis(std::time::SystemTime::now()));
     let response = client.thread_status(&request_id, thread_id).await?;
@@ -142,12 +148,6 @@ async fn thread_status(cli: &Cli, home: &std::path::Path, thread_id: &str) -> Re
     Ok(())
 }
 
-fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is not set; pass --socket explicitly")
-}
-
 fn apply_overrides(config: &mut Config, cli: &Cli) {
     if let Some(socket) = &cli.socket {
         config.bridge.socket = Some(socket.clone());
@@ -157,7 +157,7 @@ fn apply_overrides(config: &mut Config, cli: &Cli) {
     }
 }
 
-fn build_client(cli: &Cli, home: &std::path::Path) -> Result<BridgeClient> {
+fn build_client(cli: &Cli, home: Option<&std::path::Path>) -> Result<BridgeClient> {
     // The queries only need bridge settings, so a config file is optional and is
     // not validated for a target it will never use.
     let mut config = match &cli.config {
@@ -165,7 +165,15 @@ fn build_client(cli: &Cli, home: &std::path::Path) -> Result<BridgeClient> {
         None => Config::default(),
     };
     apply_overrides(&mut config, cli);
-    Ok(BridgeClient::new(config.client_config(home)))
+
+    if config.bridge.socket.is_none() && home.is_none() {
+        // Without HOME the default socket path cannot be built, so say what to do
+        // rather than resolving a nonsense path.
+        anyhow::bail!("HOME is not set; pass --socket or set [bridge] socket in the config");
+    }
+    Ok(BridgeClient::new(
+        config.client_config(home.unwrap_or(std::path::Path::new(""))),
+    ))
 }
 
 fn build_logger(config: &Config, home: &std::path::Path) -> Result<Logger> {
